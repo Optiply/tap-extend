@@ -1,1 +1,135 @@
 # tap-extend
+
+A [Singer](https://www.singer.io/) tap for the **Extend Commerce (Lxir) REST API**, built with the [hotglue Singer SDK](https://github.com/hotgluexyz/singer-sdk).
+
+Developed and maintained by [Optiply](mailto:dev@optiply.com) · License: Apache-2.0
+
+---
+
+## Overview
+
+`tap-extend` extracts data from the Extend Commerce REST API and outputs it in the Singer format, making it compatible with any Singer-based data pipeline (Meltano, hotglue, etc.).
+
+---
+
+## Streams
+
+| Stream | Endpoint | Replication |
+|---|---|---|
+| `SuppliersStream` | `GET /Supplier` | FULL_TABLE |
+| `SupplierAgreementsStream` | `GET /SupplierAgreement` | FULL_TABLE (active=true) |
+| `ProductSupplierAgreementsStream` | `GET /ProductSupplierAgreements` | FULL_TABLE |
+| `ProductsStream` | `GET /Products` | INCREMENTAL (`modifiedDateFrom`) |
+| `ProductAvailabilityStream` | `GET /ProductAvailability` | INCREMENTAL (`modifiedDateFrom`) |
+| `CustomerOrdersStream` | `GET /CustomerOrders` | INCREMENTAL (`modifiedDateFrom`) |
+| `PurchaseOrdersStream` | `GET /PurchaseOrders` | INCREMENTAL (`createDateFrom`) |
+| `ReportsOrderHeadersStream` | `GET /reports/{client}/OrderHeaders` | INCREMENTAL (day-by-day `changeDate`) |
+| `ReportsOrderRowsStream` | `GET /reports/{client}/OrderRows` | INCREMENTAL (day-by-day `changeDate`) |
+
+All streams share a common `ExtendStream` base class that handles authentication, HTTP requests, and state management.
+
+---
+
+## Requirements
+
+- Python `>=3.8, <3.12`
+- [Poetry](https://python-poetry.org/)
+
+---
+
+## Installation
+
+```bash
+cd taps/tap-extend
+poetry install
+```
+
+---
+
+## Configuration
+
+Copy `config.json.example` to `config.json` and fill in your credentials:
+
+```json
+{
+  "api_url": "https://s05.extend.se/RESTAPI",
+  "client": "YOURCLIENT",
+  "username": "your-username",
+  "password": "your-password",
+  "start_date": "2024-01-01T00:00:00Z",
+  "requests_per_second": 4,
+  "warehouse_codes": ["WAREHOUSE1", "WAREHOUSE2"]
+}
+```
+
+### Configuration Reference
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `api_url` | string | ✅ | Base URL for the Extend Commerce REST API |
+| `client` | string | ✅ | Your Extend client identifier |
+| `username` | string | ✅ | API username |
+| `password` | string | ✅ | API password |
+| `start_date` | string (ISO 8601) | ✅ | Earliest date to sync incremental streams from |
+| `requests_per_second` | integer | ❌ | Rate limit for API calls (default: 4) |
+| `warehouse_codes` | array of strings | ❌ | Filter by specific warehouse codes |
+
+---
+
+## Usage
+
+### Run the tap directly
+
+```bash
+tap-extend --config config.json
+```
+
+Or using the alternative entry point alias:
+
+```bash
+tap-extend-commerce --config config.json
+```
+
+### Run with a Singer target
+
+```bash
+tap-extend --config config.json | target-jsonl
+```
+
+### Run with state (for incremental streams)
+
+```bash
+tap-extend --config config.json --state state.json | target-jsonl
+```
+
+---
+
+## Development
+
+### Running Tests
+
+```bash
+poetry run pytest tests/
+```
+
+### Project Structure
+
+```
+tap-extend/
+├── tap_extend/
+│   ├── __init__.py
+│   ├── tap.py        # TapExtend class and CLI entry point
+│   └── streams.py    # All stream definitions
+├── tests/
+├── config.json.example
+├── connector-config.json
+├── pyproject.toml
+└── Extend Commerce.postman_collection.json
+```
+
+---
+
+## Additional Resources
+
+- **Postman Collection**: `Extend Commerce.postman_collection.json` — a ready-to-use Postman collection for exploring the Extend Commerce API endpoints.
+- **Connector Config**: `connector-config.json` — connector-level configuration for use with hotglue or similar platforms.
