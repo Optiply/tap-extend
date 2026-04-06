@@ -1,0 +1,21 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "tap-extend"
+version = "0.1.0"
+description = "Singer tap for Extend Commerce (Lxir) REST API, built with the hotglue Singer SDK"
+authors = ["Optiply <dev@optiply.com>"]
+license = "Apache-2.0"
+packages = [{ include = "tap_extend" }]
+
+[tool.poetry.dependencies]
+python = ">=3.8,<3.12"
+hotglue-singer-sdk = ">=1.0.0"
+requests = ">=2.28"
+backoff = ">=1.8"
+
+[tool.poetry.scripts]
+tap-extend = "tap_extend.tap:TapExtend.cli"
+tap-extend-commerce = "tap_extend.tap:TapExtend.cli"

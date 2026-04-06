@@ -1,0 +1,53 @@
+{
+  "tap": "extend-commerce",
+  "category": "WMS & Fulfilment",
+  "install_uri": {
+    "env": "git+https://github.com/joaoraposooptiply/Op-Integrations.git#subdirectory=taps/tap-extend"
+  },
+  "connect_ui_params": {
+    "username": {
+      "label": "Username",
+      "description": "Your Extend Commerce API username."
+    },
+    "password": {
+      "label": "Password",
+      "description": "Your Extend Commerce API password.",
+      "type": "password"
+    },
+    "client": {
+      "label": "Client Shortname",
+      "description": "Your client identifier in Extend Commerce. Example: MAXGAMING"
+    },
+    "warehouse_codes": {
+      "label": "Warehouse Codes",
+      "description": "Comma-separated list of warehouse codes to sync. Leave empty to sync all. Exclude RMA/returns warehouses (e.g. MAXRMA).",
+      "type": "text",
+      "required": false
+    },
+    "requests_per_second": {
+      "label": "Requests Per Second",
+      "description": "Client-side throttle for Extend API calls. Default 4 req/s to stay below Extend's standard 5 req/s limit. Lower this if Extend marks a tenant or endpoint as low-performance.",
+      "type": "number",
+      "required": false
+    },
+    "sync_leadTime_supProducts": {
+      "label": "Sync Lead Time from Supplier Agreements?",
+      "description": "If set to 'true', lead times (manufacturing, transport, customs) will be imported from Extend to Optiply for supplier products.",
+      "type": "boolean",
+      "required": false
+    }
+  },
+  "config": {
+    "start_date": "2010-01-01T00:00:00Z",
+    "api_url": "https://s05.extend.se/RESTAPI",
+    "requests_per_second": 4,
+    "warehouse_codes": null
+  },
+  "label": "Extend Commerce",
+  "icon": "https://s3.amazonaws.com/cdn.hotglue.xyz/images/logos/extend-commerce.svg",
+  "domain": "extend.se",
+  "isForked": true,
+  "validation_supported": false,
+  "default_import_scheduler": "*/15 * * * *",
+  "default_export_scheduler": "*/10 * * * *"
+}

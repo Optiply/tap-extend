@@ -1,0 +1,9 @@
+{
+  "api_url": "https://s05.extend.se/RESTAPI",
+  "client": "YOURCLIENT",
+  "username": "your-username",
+  "password": "your-password",
+  "start_date": "2024-01-01T00:00:00Z",
+  "requests_per_second": 4,
+  "warehouse_codes": ["WAREHOUSE1", "WAREHOUSE2"]
+}

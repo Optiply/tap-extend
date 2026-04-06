@@ -1,0 +1,423 @@
+{
+  "info": {
+    "name": "Extend Commerce (Lxir)",
+    "description": "Extend Commerce REST API v1.0.\n\nAuth: set `username` + `password` in collection variables. The pre-request script auto-generates `basic_token`.\nBase URL: {{base_url}}/v1_0/{{client}}/\n\nDocs: https://developer.lxir.se/RESTAPI/swagger/ui/index",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://s05.extend.se/RESTAPI", "type": "string" },
+    { "key": "client",   "value": "",                            "type": "string" },
+    { "key": "username", "value": "",                                "type": "string" },
+    { "key": "password", "value": "",                                "type": "string" },
+    { "key": "basic_token", "value": "",                             "type": "string", "description": "Auto-set by pre-request script" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "const u = pm.variables.get('username');",
+          "const p = pm.variables.get('password');",
+          "if (u && p) pm.variables.set('basic_token', btoa(u + ':' + p));"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Suppliers",
+      "description": "Company-level supplier entities. These are the parent of SupplierAgreements.",
+      "item": [
+        {
+          "name": "List Suppliers",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/Supplier?pageNumber=1",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "Supplier"],
+              "query": [
+                { "key": "pageNumber",      "value": "1",  "description": "1-based page number" },
+                { "key": "supplierNumber",  "value": "",   "description": "Filter by supplier number (exact)", "disabled": true },
+                { "key": "name",            "value": "",   "description": "Filter by supplier name",           "disabled": true },
+                { "key": "city",            "value": "",   "description": "Filter by city",                    "disabled": true },
+                { "key": "countryId",       "value": "",   "description": "Filter by country code (e.g. SE)",  "disabled": true }
+              ]
+            },
+            "description": "Returns {SupplierList, paginationInfo}. FULL_TABLE — no date filter available."
+          }
+        },
+        {
+          "name": "Get Supplier by Number",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/Supplier/:supplierNumber",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "Supplier", ":supplierNumber"],
+              "variable": [{ "key": "supplierNumber", "value": "", "description": "e.g. 1001" }]
+            },
+            "description": "Full detail for a single supplier."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Supplier Agreements",
+      "description": "Contract/brand-level — these map to Optiply Suppliers. Carry lead times, currency, payment terms. NOTE: supplierNumber FK is NOT in the list response, only in the detail endpoint.",
+      "item": [
+        {
+          "name": "List Supplier Agreements",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/SupplierAgreement?pageNumber=1",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "SupplierAgreement"],
+              "query": [
+                { "key": "pageNumber",      "value": "1",    "description": "1-based page number" },
+                { "key": "supplierNumber",  "value": "",     "description": "Filter by parent supplier number", "disabled": true },
+                { "key": "name",            "value": "",     "description": "Filter by agreement name",          "disabled": true },
+                { "key": "active",          "value": "true", "description": "true/false — only active agreements", "disabled": true },
+                { "key": "countryId",       "value": "",     "description": "Filter by country code",             "disabled": true },
+                { "key": "validFrom",       "value": "",     "description": "Filter by start date",               "disabled": true },
+                { "key": "validTo",         "value": "",     "description": "Filter by end date",                  "disabled": true }
+              ]
+            },
+            "description": "Returns {SupplierAgreementList, paginationInfo}."
+          }
+        },
+        {
+          "name": "Get Supplier Agreement by Number",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/SupplierAgreement/:supplierAgreementNumber",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "SupplierAgreement", ":supplierAgreementNumber"],
+              "variable": [{ "key": "supplierAgreementNumber", "value": "", "description": "e.g. 456 — integer ID" }]
+            },
+            "description": "Detail includes supplierNumber (FK to parent Supplier company) — not returned by list."
+          }
+        },
+        {
+          "name": "List Agreements for a Supplier",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/SupplierAgreement?supplierNumber=&active=true&pageNumber=1",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "SupplierAgreement"],
+              "query": [
+                { "key": "supplierNumber", "value": "", "description": "Parent supplier number — fill in" },
+                { "key": "active",         "value": "true" },
+                { "key": "pageNumber",     "value": "1" }
+              ]
+            },
+            "description": "All active agreements under a specific supplier company. Fill in supplierNumber."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Products",
+      "description": "Product catalogue. API returns one row per product-per-warehouse — deduplicate by productNumber. Detail endpoint returns productSuppliers (supplier-product links).",
+      "item": [
+        {
+          "name": "List Products",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/Products?pageCount=100&pageOffset=0&modifiedDateFrom=2026-01-01T00:00:00",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "Products"],
+              "query": [
+                { "key": "pageCount",              "value": "100",                    "description": "Page size — use pageCount+pageOffset, NOT pageNumber" },
+                { "key": "pageOffset",             "value": "0",                      "description": "Record offset (not page number)" },
+                { "key": "modifiedDateFrom",       "value": "2026-01-01T00:00:00",   "description": "Incremental filter — ISO datetime UTC" },
+                { "key": "modifiedDateTo",         "value": "",                       "description": "Upper bound",                                        "disabled": true },
+                { "key": "productNumber",          "value": "",                       "description": "Filter by product number (exact)",                   "disabled": true },
+                { "key": "productName",            "value": "",                       "description": "Filter by product name",                             "disabled": true },
+                { "key": "supplyMode",             "value": "",                       "description": "e.g. Warehouse, DirectDelivery",                     "disabled": true },
+                { "key": "supplierNumber",         "value": "",                       "description": "Filter by supplier number",                          "disabled": true },
+                { "key": "supplierProductNumber",  "value": "",                       "description": "Supplier's own product number",                      "disabled": true },
+                { "key": "warehouse",              "value": "",                       "description": "Filter to a single warehouse shortname",       "disabled": true },
+                { "key": "productProperty",        "value": "",                       "description": "Filter by product property name",                    "disabled": true }
+              ]
+            },
+            "description": "Returns a plain JSON array (no wrapper). One row per product-per-warehouse. Pagination: pageCount + pageOffset."
+          }
+        },
+        {
+          "name": "Get Product (detail + suppliers)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/Products/:productNumber",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "Products", ":productNumber"],
+              "variable": [{ "key": "productNumber", "value": "", "description": "e.g. ART-12345" }]
+            },
+            "description": "Returns full product detail including productSuppliers array. Key supplier fields: supplierAgreementNumber, supplierAgreement, price (excl VAT), vatPercent, manufacturingLeadTimeHour, supplierProductNumber."
+          }
+        },
+        {
+          "name": "Get Product Availability",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/ProductAvailability?pageNumber=1",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "ProductAvailability"],
+              "query": [
+                { "key": "pageNumber",       "value": "1" },
+                { "key": "productNumber",    "value": "", "description": "Filter to a single product",     "disabled": true },
+                { "key": "warehouse",        "value": "", "description": "Filter to a single warehouse",   "disabled": true },
+                { "key": "modifiedDateFrom", "value": "", "description": "Modified since ISO datetime",    "disabled": true }
+              ]
+            },
+            "description": "Returns availability info per product/warehouse including next receiving date and expected incoming stock."
+          }
+        },
+        {
+          "name": "Get Product Availability (single)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/ProductAvailability/:productNumber/:warehouse",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "ProductAvailability", ":productNumber", ":warehouse"],
+              "variable": [
+                { "key": "productNumber", "value": "" },
+                { "key": "warehouse",     "value": "" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Warehouse Stock Levels",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/WarehouseStockLevels?warehouse={{warehouse}}&pageNumber=1",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "WarehouseStockLevels"],
+              "query": [
+                { "key": "warehouse",     "value": "", "description": "Required — warehouse shortname" },
+                { "key": "productNumber", "value": "",           "description": "Optional — filter to single product", "disabled": true },
+                { "key": "pageNumber",    "value": "1" }
+              ]
+            },
+            "description": "Stock levels per product for a given warehouse."
+          }
+        },
+        {
+          "name": "List Product–Supplier Agreement Links",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/ProductSupplierAgreements?pageNumber=1",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "ProductSupplierAgreements"],
+              "query": [
+                { "key": "pageNumber",              "value": "1" },
+                { "key": "productNumber",           "value": "", "description": "All agreements for a product",         "disabled": true },
+                { "key": "supplierAgreementNumber", "value": "", "description": "All products under an agreement",       "disabled": true }
+              ]
+            },
+            "description": "All product↔SupplierAgreement links. Filter by productNumber or supplierAgreementNumber to scope results."
+          }
+        },
+        {
+          "name": "Get Product–Supplier Agreement (single)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/ProductSupplierAgreements/:productNumber/:supplierAgreementNumber",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "ProductSupplierAgreements", ":productNumber", ":supplierAgreementNumber"],
+              "variable": [
+                { "key": "productNumber",           "value": "" },
+                { "key": "supplierAgreementNumber", "value": "" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Customer Orders",
+      "description": "Sell orders. IMPORTANT: modifiedDateFrom is mandatory — omitting it causes the endpoint to time out.",
+      "item": [
+        {
+          "name": "List Customer Orders",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/CustomerOrders?pageCount=100&pageOffset=0&modifiedDateFrom=2026-01-01T00:00:00",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "CustomerOrders"],
+              "query": [
+                { "key": "pageCount",            "value": "100",                  "description": "Page size — use pageCount+pageOffset, NOT pageNumber" },
+                { "key": "pageOffset",           "value": "0" },
+                { "key": "modifiedDateFrom",     "value": "2026-01-01T00:00:00", "description": "REQUIRED — omitting causes timeout. ISO datetime UTC" },
+                { "key": "changeDateTo",         "value": "",                     "description": "Upper bound on change date",        "disabled": true },
+                { "key": "orderNumber",          "value": "",                     "description": "Filter by exact order number",      "disabled": true },
+                { "key": "orderNumberExternal",  "value": "",                     "description": "External system order number",      "disabled": true },
+                { "key": "orderStatus",          "value": "",                     "description": "e.g. Ordered, Delivered, Invoiced", "disabled": true },
+                { "key": "customerNumber",       "value": "",                     "description": "Filter by customer",                "disabled": true },
+                { "key": "customerName",         "value": "",                     "description": "Filter by customer name",           "disabled": true },
+                { "key": "productNumber",        "value": "",                     "description": "Orders containing this product",    "disabled": true },
+                { "key": "productName",          "value": "",                     "description": "Orders containing this product name", "disabled": true },
+                { "key": "warehouse",            "value": "",                     "description": "Filter by warehouse",               "disabled": true },
+                { "key": "orderDateFrom",        "value": "",                     "description": "Order placed date from",            "disabled": true },
+                { "key": "orderDateTo",          "value": "",                     "description": "Order placed date to",              "disabled": true },
+                { "key": "supplyMode",           "value": "",                     "description": "e.g. Warehouse, DirectDelivery",    "disabled": true },
+                { "key": "companyGroup",         "value": "",                     "description": "Filter by company group",           "disabled": true },
+                { "key": "invoiceNumber",        "value": "",                     "description": "Filter by invoice number",          "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Customer Order (detail + rows)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/CustomerOrders/:orderNumber",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "CustomerOrders", ":orderNumber"],
+              "variable": [{ "key": "orderNumber", "value": "" }]
+            },
+            "description": "Returns {orderHeader, orderRows}. Rows contain salesData.unitPrice (excl. VAT confirmed), salesData.vatPercent, product.productNumber. Freight rows have supplyMode=Freight — exclude from SellOrderLines."
+          }
+        },
+        {
+          "name": "List Orders by Status",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/CustomerOrders?pageCount=100&pageOffset=0&modifiedDateFrom=2026-01-01T00:00:00&orderStatus=Ordered",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "CustomerOrders"],
+              "query": [
+                { "key": "pageCount",        "value": "100" },
+                { "key": "pageOffset",       "value": "0" },
+                { "key": "modifiedDateFrom", "value": "2026-01-01T00:00:00" },
+                { "key": "orderStatus",      "value": "Ordered", "description": "Ordered | Delivered | Invoiced | Completed | Cancelled" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Orders Containing a Product",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/CustomerOrders?pageCount=100&pageOffset=0&modifiedDateFrom=2026-01-01T00:00:00&productNumber=",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "CustomerOrders"],
+              "query": [
+                { "key": "pageCount",        "value": "100" },
+                { "key": "pageOffset",       "value": "0" },
+                { "key": "modifiedDateFrom", "value": "2026-01-01T00:00:00" },
+                { "key": "productNumber",    "value": "", "description": "Fill in product number" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Purchase Orders",
+      "description": "Buy orders. Detail endpoint returns header (incl. supplierAgreementNumber), rows (with unitDetails for received quantities), and shipments.",
+      "item": [
+        {
+          "name": "List Purchase Orders",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/PurchaseOrders?pageNumber=1&createDateFrom=2026-01-01T00:00:00",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "PurchaseOrders"],
+              "query": [
+                { "key": "pageNumber",         "value": "1",                    "description": "1-based — use pageNumber here (NOT pageCount/pageOffset)" },
+                { "key": "createDateFrom",     "value": "2026-01-01T00:00:00", "description": "Incremental filter — ISO datetime UTC" },
+                { "key": "createDateTo",       "value": "",                     "description": "Upper bound on create date",                    "disabled": true },
+                { "key": "purchaseNumber",     "value": "",                     "description": "Filter by exact PO number (e.g. RP-10748)",     "disabled": true },
+                { "key": "externalOrderNumber","value": "",                     "description": "External system order number",                  "disabled": true },
+                { "key": "supplierNumber",     "value": "",                     "description": "Filter by supplier company number",             "disabled": true },
+                { "key": "supplierOrderNumber","value": "",                     "description": "PO number used by the supplier",                "disabled": true },
+                { "key": "warehouse",          "value": "",                     "description": "Filter by warehouse shortname",          "disabled": true },
+                { "key": "IsOpen",             "value": "true",                 "description": "true = only open POs",                          "disabled": true },
+                { "key": "IsReceived",         "value": "true",                 "description": "true = only POs with something received",       "disabled": true }
+              ]
+            },
+            "description": "Returns {purchaseOrderList, paginationInfo}. Use paginationInfo.totalPages to paginate."
+          }
+        },
+        {
+          "name": "Get Purchase Order (detail)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/PurchaseOrders/:purchaseNumber",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "PurchaseOrders", ":purchaseNumber"],
+              "variable": [{ "key": "purchaseNumber", "value": "", "description": "e.g. RP-10748" }]
+            },
+            "description": "Returns {header, rows, shipments}.\n- header.supplier.supplierAgreementNumber = FK to SupplierAgreement (use this for Optiply Supplier FK, NOT supplierNumber)\n- rows[].unitDetails[] = received stocked units (sum quantity = received qty for ReceiptLines)\n- rows[].purchaseDataProductUnit = ordered qty + unit price\n- rows[].rowStatus = Ordered | PartiallyReceived | Received | Cancelled"
+          }
+        },
+        {
+          "name": "Open POs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/PurchaseOrders?pageNumber=1&IsOpen=true",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "PurchaseOrders"],
+              "query": [
+                { "key": "pageNumber", "value": "1" },
+                { "key": "IsOpen",     "value": "true" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Received POs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/PurchaseOrders?pageNumber=1&IsReceived=true",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "PurchaseOrders"],
+              "query": [
+                { "key": "pageNumber",   "value": "1" },
+                { "key": "IsReceived",   "value": "true" },
+                { "key": "createDateFrom", "value": "", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "POs by Supplier",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "ExtendBasicAuthorization", "value": "Basic {{basic_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/v1_0/{{client}}/PurchaseOrders?pageNumber=1&supplierNumber=&createDateFrom=2026-01-01T00:00:00",
+              "host": ["{{base_url}}"], "path": ["v1_0", "{{client}}", "PurchaseOrders"],
+              "query": [
+                { "key": "pageNumber",     "value": "1" },
+                { "key": "supplierNumber", "value": "", "description": "Fill in supplier number" },
+                { "key": "createDateFrom", "value": "2026-01-01T00:00:00" }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
