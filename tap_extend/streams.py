@@ -1348,7 +1348,7 @@ _REPORTS_ORDER_HEADER_FIELDS = [
     ("palletRegistrationNumber", th.StringType),
     ("transportCondition", th.StringType),
     ("handlingMark", th.StringType),
-    ("orderPaymentStatus", th.IntegerType),
+    ("orderPaymentStatus", th.StringType),
     ("freightFree", th.BooleanType),
     ("latitude", th.StringType),
     ("longitude", th.StringType),
@@ -1453,6 +1453,8 @@ class ReportsOrderHeadersStream(ExtendStream):
                 for field_name, _field_type in _REPORTS_ORDER_HEADER_FIELDS
             }
             record["customerNumber"] = str(record.get("customerNumber") or "")
+            if record.get("orderPaymentStatus") is not None:
+                record["orderPaymentStatus"] = str(record["orderPaymentStatus"])
             yield record
 
 

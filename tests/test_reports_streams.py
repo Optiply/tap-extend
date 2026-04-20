@@ -237,6 +237,7 @@ def test_reports_order_headers_preserves_observed_header_report_fields(monkeypat
         "askedDeliveryDate": "2026-04-15T00:00:00+02:00",
         "orderType": "Normal",
         "orderStatus": "Incoming",
+        "orderPaymentStatus": 0,
         "customerNumber": "2705237",
         "orderReference": "Example Customer",
         "invoiceEmail": "customer@example.test",
@@ -284,6 +285,7 @@ def test_reports_order_headers_preserves_observed_header_report_fields(monkeypat
         "end_date": "2026-04-15",
     }]
     assert records[0]["orderNumber"] == "ORDER-1001"
+    assert records[0]["orderPaymentStatus"] == "0"
     assert records[0]["orderReference"] == "Example Customer"
     assert records[0]["requestedTransportMode"] == "Test Transport Mode"
     assert records[0]["deliveryAddress1"] == "Example Street 1"
