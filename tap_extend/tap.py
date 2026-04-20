@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, List
 
 from hotglue_singer_sdk import Tap
@@ -18,6 +19,25 @@ from tap_extend.streams import (
     SupplierAgreementsStream,
     SuppliersStream,
 )
+
+
+class _SuppressEmptyUnmappedPropertiesFilter(logging.Filter):
+    """Suppress SDK noise when it logs an empty tuple of unmapped properties."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Properties () were present" not in record.getMessage()
+
+
+def _install_logging_filters() -> None:
+    tap_logger = logging.getLogger("tap-extend")
+    if not any(
+        isinstance(existing_filter, _SuppressEmptyUnmappedPropertiesFilter)
+        for existing_filter in tap_logger.filters
+    ):
+        tap_logger.addFilter(_SuppressEmptyUnmappedPropertiesFilter())
+
+
+_install_logging_filters()
 
 
 class TapExtend(Tap):
@@ -70,28 +90,12 @@ class TapExtend(Tap):
             description="Earliest record date to sync (ISO 8601)",
         ),
         th.Property(
-            "end_date",
-            th.DateTimeType,
-            required=False,
-            description="Latest record date to sync (ISO 8601). Used as upper bound on incremental streams.",
-        ),
-        th.Property(
             "warehouse_codes",
             th.StringType,
             required=False,
             description=(
                 "Comma-separated warehouse codes to include. "
                 "If omitted, all warehouses are synced."
-            ),
-        ),
-        th.Property(
-            "requests_per_second",
-            th.NumberType,
-            required=False,
-            default=4,
-            description=(
-                "Client-side request throttle for Extend API calls. "
-                "Default 4 req/s to stay below Extend's standard 5 req/s limit."
             ),
         ),
     ).to_dict()
@@ -105,8 +109,18 @@ class TapExtend(Tap):
         return wc or None
 
     def load_state(self, state: dict[str, Any]) -> None:
-        """Normalize legacy scalar bookmarks before delegating to the SDK."""
-        super().load_state(self._normalize_legacy_bookmarks(state))
+        """Normalize bookmarks and preserve report-only top-level overrides."""
+        normalized_state = self._normalize_legacy_bookmarks(state)
+        super().load_state(normalized_state)
+
+        # hotglue_singer_sdk.Tap.load_state only copies values under
+        # "bookmarks". Keep these report-only controls at the root of the
+        # in-memory tap state so report streams can use one-off backfill bounds
+        # without exposing them as config.
+        for key in ("reports_start_date", "reports_end_date"):
+            value = normalized_state.get(key)
+            if value not in (None, ""):
+                self.state[key] = value
 
     def _normalize_legacy_bookmarks(self, state: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(state, dict):

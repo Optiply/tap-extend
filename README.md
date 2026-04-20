@@ -57,7 +57,6 @@ Copy `config.json.example` to `config.json` and fill in your credentials:
   "username": "your-username",
   "password": "your-password",
   "start_date": "2024-01-01T00:00:00Z",
-  "requests_per_second": 4,
   "warehouse_codes": ["WAREHOUSE1", "WAREHOUSE2"]
 }
 ```
@@ -71,7 +70,6 @@ Copy `config.json.example` to `config.json` and fill in your credentials:
 | `username` | string | ✅ | API username |
 | `password` | string | ✅ | API password |
 | `start_date` | string (ISO 8601) | ✅ | Earliest date to sync incremental streams from |
-| `requests_per_second` | integer | ❌ | Rate limit for API calls (default: 4) |
 | `warehouse_codes` | array of strings | ❌ | Filter by specific warehouse codes |
 
 ---
@@ -100,6 +98,28 @@ tap-extend --config config.json | target-jsonl
 
 ```bash
 tap-extend --config config.json --state state.json | target-jsonl
+```
+
+
+#### Report-only date override state
+
+For a one-off Report Headers/Rows backfill, put report date bounds at the top level of the Singer state file. These override report bookmarks and `config.start_date` for report streams only.
+
+```json
+{
+  "bookmarks": {
+    "reports_order_headers": {
+      "replication_key": "changeDate",
+      "replication_key_value": "2026-04-19T00:00:00Z"
+    },
+    "reports_order_rows": {
+      "replication_key": "changeDate",
+      "replication_key_value": "2026-04-19T00:00:00Z"
+    }
+  },
+  "reports_start_date": "2026-01-01",
+  "reports_end_date": "2026-01-31"
+}
 ```
 
 ---

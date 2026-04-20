@@ -45,6 +45,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+REQUESTS_PER_SECOND = 4.0
+RETRYABLE_CLIENT_ERROR_WAIT_SECONDS = 10.0
+RETRYABLE_CLIENT_ERROR_MAX_ATTEMPTS = 0  # 0 means retry indefinitely.
+_LOGGED_UNMAPPED_REPORT_FIELDS: set[tuple[str, tuple[str, ...]]] = set()
+
 
 class _RetryableError(Exception):
     """Raised for errors that should trigger backoff retry (429, 5xx)."""
@@ -88,16 +93,30 @@ class ExtendStream(Stream):
 
     @property
     def requests_per_second(self) -> float:
-        raw_value = self.config.get("requests_per_second", 4)
-        try:
-            requests_per_second = float(raw_value)
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid requests_per_second=%r. Falling back to 4 requests/second.",
-                raw_value,
+        return max(REQUESTS_PER_SECOND, 0.1)
+
+    @property
+    def sync_upper_bound(self) -> str:
+        """Return one stable upper-bound timestamp for the current tap run."""
+        tap = getattr(self, "_tap", None)
+        attr = "_extend_sync_upper_bound"
+        if tap is not None:
+            upper_bound = getattr(tap, attr, None)
+            if upper_bound is None:
+                upper_bound = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+                setattr(tap, attr, upper_bound)
+            return upper_bound
+
+        if not hasattr(self, "_extend_sync_upper_bound"):
+            self._extend_sync_upper_bound = (
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             )
-            requests_per_second = 4.0
-        return max(requests_per_second, 0.1)
+        return self._extend_sync_upper_bound
+
+    @property
+    def sync_upper_bound_date(self) -> str:
+        """Return the YYYY-MM-DD date for the current tap run upper bound."""
+        return self.sync_upper_bound[:10]
 
     @property
     def request_timeout(self) -> float:
@@ -107,6 +126,16 @@ class ExtendStream(Stream):
             return max(float(raw), 10.0)
         except (TypeError, ValueError):
             return 120.0
+
+    @property
+    def retryable_client_error_wait_seconds(self) -> float:
+        """Wait between transient Extend 400 retries, such as SQL deadlocks."""
+        return RETRYABLE_CLIENT_ERROR_WAIT_SECONDS
+
+    @property
+    def retryable_client_error_max_attempts(self) -> int:
+        """Max attempts for transient Extend 400s. 0 means retry indefinitely."""
+        return RETRYABLE_CLIENT_ERROR_MAX_ATTEMPTS
 
     def _apply_client_throttle(self) -> None:
         min_interval = 1.0 / self.requests_per_second
@@ -159,18 +188,6 @@ class ExtendStream(Stream):
             return True
         return False
 
-    def _is_retryable_client_error(self, response: requests.Response) -> bool:
-        """Return True for known transient 4xx responses misclassified by Extend."""
-        if response.status_code != 400:
-            return False
-
-        message = (response.text or "").lower()
-        if "deadlock" in message and "rerun the transaction" in message:
-            return True
-        if "timeout" in message and ("expired" in message or "execution" in message):
-            return True
-        return False
-
     @backoff.on_exception(
         backoff.expo,
         (requests.exceptions.ConnectionError, requests.exceptions.Timeout, _RetryableError),
@@ -180,38 +197,62 @@ class ExtendStream(Stream):
     )
     def _request(self, url: str, params: Optional[dict] = None) -> requests.Response:
         """GET with retry/backoff.  Only retries on 429, 5xx, connection errors, and transient 400s."""
-        self._apply_client_throttle()
-        response = self.session.get(url, params=params, timeout=self.request_timeout)
+        retryable_client_error_attempt = 0
 
-        if response.status_code == 401:
-            raise InvalidCredentialsError(
-                f"Authentication failed (401): {response.text[:300]}"
+        while True:
+            self._apply_client_throttle()
+            response = self.session.get(url, params=params, timeout=self.request_timeout)
+
+            if response.status_code == 401:
+                raise InvalidCredentialsError(
+                    f"Authentication failed (401): {response.text[:300]}"
+                )
+            if response.status_code == 429:
+                retry_after = self._delay_from_retry_after(response.headers.get("Retry-After"))
+                reset_delay = self._delay_from_reset_header(response)
+                delay_seconds = max(
+                    retry_after if retry_after is not None else 0.0,
+                    reset_delay if reset_delay is not None else 0.0,
+                    30.0,
+                )
+                logger.warning("Rate limited (429). Sleeping %.1fs.", delay_seconds)
+                time.sleep(delay_seconds)
+                self._defer_next_request(delay_seconds)
+                raise _RetryableError("Rate limited (429)")
+            if response.status_code >= 500:
+                raise _RetryableError(
+                    f"Server error ({response.status_code}): {response.text[:300]}"
+                )
+            if not self._is_retryable_client_error(response):
+                break
+
+            retryable_client_error_attempt += 1
+            max_attempts = self.retryable_client_error_max_attempts
+            if max_attempts and retryable_client_error_attempt >= max_attempts:
+                logger.error(
+                    "Transient Extend client error (%s) persisted after %d attempts: %s",
+                    response.status_code,
+                    retryable_client_error_attempt,
+                    response.text[:300],
+                )
+                break
+
+            wait_seconds = self.retryable_client_error_wait_seconds
+            max_attempts_label = f"/{max_attempts}" if max_attempts else ""
+            request_url = getattr(response, "url", None) or getattr(
+                getattr(response, "request", None), "url", url
             )
-        if response.status_code == 429:
-            retry_after = self._delay_from_retry_after(response.headers.get("Retry-After"))
-            reset_delay = self._delay_from_reset_header(response)
-            delay_seconds = max(
-                retry_after if retry_after is not None else 0.0,
-                reset_delay if reset_delay is not None else 0.0,
-                30.0,
-            )
-            logger.warning("Rate limited (429). Sleeping %.1fs.", delay_seconds)
-            time.sleep(delay_seconds)
-            self._defer_next_request(delay_seconds)
-            raise _RetryableError("Rate limited (429)")
-        if response.status_code >= 500:
-            raise _RetryableError(
-                f"Server error ({response.status_code}): {response.text[:300]}"
-            )
-        if self._is_retryable_client_error(response):
             logger.warning(
-                "Retrying transient Extend client error (%s): %s",
+                "Retrying transient Extend client error for %s (%s) in %.1fs "
+                "(attempt %d%s): %s",
+                request_url,
                 response.status_code,
+                wait_seconds,
+                retryable_client_error_attempt,
+                max_attempts_label,
                 response.text[:300],
             )
-            raise _RetryableError(
-                f"Transient client error ({response.status_code}): {response.text[:300]}"
-            )
+            time.sleep(wait_seconds)
 
         if response.headers.get("x-ratelimit-remaining") == "0":
             self._defer_next_request(self._delay_from_reset_header(response))
@@ -585,8 +626,6 @@ class ProductsStream(ExtendStream):
         else:
             modified_date_from = None
 
-        end_date = self.config.get("end_date")
-
         page_offset = 0
         page_count = 100
         total_rows = 0
@@ -595,8 +634,7 @@ class ProductsStream(ExtendStream):
             params: dict[str, Any] = {"pageCount": page_count, "pageOffset": page_offset}
             if modified_date_from:
                 params["modifiedDateFrom"] = modified_date_from
-            if end_date:
-                params["modifiedDateTo"] = str(end_date)
+            params["modifiedDateTo"] = self.sync_upper_bound
 
             try:
                 product_list = self._request(
@@ -810,8 +848,6 @@ class CustomerOrdersStream(ExtendStream):
             two_years_ago = datetime.now(timezone.utc) - timedelta(days=730)
             modified_date_from = two_years_ago.strftime("%Y-%m-%dT%H:%M:%S")
 
-        end_date = self.config.get("end_date")
-
         page_offset = 0
         page_count = 100
         total_orders = 0
@@ -822,8 +858,7 @@ class CustomerOrdersStream(ExtendStream):
                 "pageOffset": page_offset,
                 "modifiedDateFrom": modified_date_from,
             }
-            if end_date:
-                params["changeDateTo"] = str(end_date)
+            params["changeDateTo"] = self.sync_upper_bound
 
             try:
                 order_list = self._request(
@@ -976,8 +1011,7 @@ class PurchaseOrdersStream(ExtendStream):
             params_base["createDateFrom"] = str(start_replication)
         elif self.config.get("start_date"):
             params_base["createDateFrom"] = str(self.config["start_date"])
-        if self.config.get("end_date"):
-            params_base["createDateTo"] = str(self.config["end_date"])
+        params_base["createDateTo"] = self.sync_upper_bound
 
         page = 1
         while True:
@@ -1106,10 +1140,17 @@ class PurchaseOrdersStream(ExtendStream):
 # ---------------------------------------------------------------------------
 
 
-def _iter_report_days(stream: "ExtendStream", url: str, list_key: str, start_date: str, end_date: Optional[str] = None) -> Iterable[dict]:
+def _iter_report_days(
+    stream: "ExtendStream",
+    url: str,
+    list_key: str,
+    start_date: str,
+    end_date: Optional[str] = None,
+) -> Iterable[dict]:
     """Iterate a Reports endpoint one day at a time, paginating each day.
 
-    Reports endpoints require changeDate == toChangeDate (one-day window).
+    Reports endpoints use inclusive day windows:
+    changeDate=YYYY-MM-DDT00:00:00 and toChangeDate=YYYY-MM-DDT23:59:59.
     Pagination uses pageNumber (1-based); stop when paginationInfo.currentPage
     equals paginationInfo.totalPages.
 
@@ -1137,12 +1178,25 @@ def _iter_report_days(stream: "ExtendStream", url: str, list_key: str, start_dat
         day_records = 0
 
         while True:
+            change_date_from = f"{date_str}T00:00:00"
+            change_date_to = f"{date_str}T23:59:59"
             params = {
-                "changeDate": date_str,
-                "toChangeDate": date_str,
                 "pageNumber": page,
+                "changeDate": change_date_from,
+                "toChangeDate": change_date_to,
             }
             try:
+                page_started_at = time.monotonic()
+                logger.info(
+                    "Requesting Reports %s day %d/%d (%s) page %d: %s to %s",
+                    list_key,
+                    day_num,
+                    total_days,
+                    date_str,
+                    page,
+                    change_date_from,
+                    change_date_to,
+                )
                 data = stream._request(url, params=params).json()
             except requests.exceptions.HTTPError as exc:
                 response = exc.response
@@ -1150,9 +1204,9 @@ def _iter_report_days(stream: "ExtendStream", url: str, list_key: str, start_dat
                     raise
 
                 probe = stream._request(url, params={
-                    "changeDate": date_str,
-                    "toChangeDate": date_str,
                     "pageNumber": 1,
+                    "changeDate": change_date_from,
+                    "toChangeDate": change_date_to,
                 }).json()
                 total_pages = int(probe.get("paginationInfo", {}).get("totalPages") or 1)
                 if page > total_pages:
@@ -1169,14 +1223,25 @@ def _iter_report_days(stream: "ExtendStream", url: str, list_key: str, start_dat
             items = data.get(list_key, [])
             pagination = data.get("paginationInfo", {})
             day_records += len(items)
+            current_page = int(pagination.get("currentPage") or page)
+            total_pages = int(pagination.get("totalPages") or 1)
+            logger.info(
+                "Reports %s day %d/%d (%s) page %d/%d returned %d records in %.1fs",
+                list_key,
+                day_num,
+                total_days,
+                date_str,
+                current_page,
+                total_pages,
+                len(items),
+                time.monotonic() - page_started_at,
+            )
 
             for item in items:
                 if not item.get("changeDate"):
                     item["changeDate"] = date_str + "T00:00:00+00:00"
                 yield item
 
-            current_page = int(pagination.get("currentPage") or page)
-            total_pages = int(pagination.get("totalPages") or 1)
             if not total_pages or current_page >= total_pages:
                 break
             page += 1
@@ -1188,16 +1253,159 @@ def _iter_report_days(stream: "ExtendStream", url: str, list_key: str, start_dat
         current += timedelta(days=1)
 
 
+def _log_unmapped_report_fields(
+    stream_name: str,
+    item: dict,
+    field_defs: list[tuple[str, Any]],
+) -> None:
+    """Log report API fields missing from the tap schema/mapping once."""
+    mapped_fields = {field_name for field_name, _field_type in field_defs}
+    unmapped_fields = tuple(sorted(set(item) - mapped_fields))
+    if not unmapped_fields:
+        return
+
+    log_key = (stream_name, unmapped_fields)
+    if log_key in _LOGGED_UNMAPPED_REPORT_FIELDS:
+        return
+
+    _LOGGED_UNMAPPED_REPORT_FIELDS.add(log_key)
+    logger.warning(
+        "Reports API returned fields not mapped in '%s': %s",
+        stream_name,
+        ", ".join(unmapped_fields),
+    )
+
+
+def _report_state_date_range(stream: "ExtendStream") -> tuple[Optional[str], Optional[str]]:
+    """Return report-only date range overrides from Singer state, if present.
+
+    Supported state locations, in precedence order:
+      1. top-level reports_start_date / reports_end_date
+      2. bookmarks.<stream_name>.reports_start_date / reports_end_date
+         (kept as a developer/backward-compatible escape hatch)
+
+    Dates are normalized to YYYY-MM-DD because Reports endpoints are
+    day-window based.
+    """
+    tap_state = getattr(stream, "tap_state", None)
+    if tap_state is None:
+        tap_state = getattr(getattr(stream, "_tap", None), "state", {}) or {}
+    if not isinstance(tap_state, dict):
+        return None, None
+
+    candidates = [tap_state]
+
+    bookmarks = tap_state.get("bookmarks", {})
+    if isinstance(bookmarks, dict):
+        candidates.append(bookmarks.get(stream.name))
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+
+        start_date = candidate.get("reports_start_date")
+        end_date = candidate.get("reports_end_date")
+        if start_date or end_date:
+            return (
+                str(start_date)[:10] if start_date else None,
+                str(end_date)[:10] if end_date else None,
+            )
+
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # ReportsOrderHeadersStream  —  GET /reports/{client}/OrderHeaders
 # ---------------------------------------------------------------------------
 
 
+_REPORTS_ORDER_HEADER_FIELDS = [
+    ("orderNumber", th.StringType),
+    ("orderNumberExternal", th.StringType),
+    ("orderNumberEndCustomer", th.StringType),
+    ("orderDate", th.DateTimeType),
+    ("changeDate", th.DateTimeType),
+    ("askedDeliveryDate", th.DateTimeType),
+    ("slaDate", th.DateTimeType),
+    ("orderType", th.StringType),
+    ("orderStatus", th.StringType),
+    ("orderMethod", th.StringType),
+    ("customerNumber", th.StringType),
+    ("orderReference", th.StringType),
+    ("acceptPartialDelivery", th.BooleanType),
+    ("invoiceEmail", th.StringType),
+    ("orderConfirmationEmail", th.StringType),
+    ("deliveryAdviceEmail", th.StringType),
+    ("phoneNumber2", th.StringType),
+    ("phoneNumber", th.StringType),
+    ("shippingMark", th.StringType),
+    ("notes", th.StringType),
+    ("orderPriority", th.IntegerType),
+    ("orderReference2", th.StringType),
+    ("deliveryDayLeadTimeOverride", th.BooleanType),
+    ("requestedForwarder", th.StringType),
+    ("requestedTransportMode", th.StringType),
+    ("palletRegistrationNumber", th.StringType),
+    ("transportCondition", th.StringType),
+    ("handlingMark", th.StringType),
+    ("orderPaymentStatus", th.IntegerType),
+    ("freightFree", th.BooleanType),
+    ("latitude", th.StringType),
+    ("longitude", th.StringType),
+    ("invoiceOnlyAtFullOrderDelivery", th.BooleanType),
+    ("consolidateDelivery", th.BooleanType),
+    ("deliveryDescription1", th.StringType),
+    ("deliveryDescription2", th.StringType),
+    ("deliveryDescription3", th.StringType),
+    ("deliveryDescription4", th.StringType),
+    ("consignmentInventoryHandling", th.StringType),
+    ("arcNumber", th.StringType),
+    ("departureId", th.StringType),
+    ("routeId", th.StringType),
+    ("orderReviewReasonNotes", th.StringType),
+    ("doorCode", th.StringType),
+    ("salesChannel", th.StringType),
+    ("createdBy", th.StringType),
+    ("lastmodifiedBy", th.StringType),
+    ("paymentType", th.StringType),
+    ("termsOfPayment", th.StringType),
+    ("isProductSample", th.BooleanType),
+    ("customerGLN", th.StringType),
+    ("clientSalesChannel", th.StringType),
+    ("salesMan", th.StringType),
+    ("customerFinancialCategory", th.StringType),
+    ("isAgreedOrderForCompanyGroup", th.BooleanType),
+    ("isAgreedOrderFixedPriceAgreement", th.BooleanType),
+    ("isAgreedOrderCustomerOwned", th.BooleanType),
+    ("anonymized", th.BooleanType),
+    ("requirePrepayment", th.BooleanType),
+    ("orderDeliveryUpdateEmailType", th.StringType),
+    ("deliveryName1", th.StringType),
+    ("deliveryName2", th.StringType),
+    ("deliveryAddress1", th.StringType),
+    ("deliveryAddress2", th.StringType),
+    ("deliveryAddress3", th.StringType),
+    ("deliveryPostalCode", th.StringType),
+    ("deliveryCity", th.StringType),
+    ("deliveryState", th.StringType),
+    ("deliveryCountryId", th.StringType),
+    ("invoiceName", th.StringType),
+    ("invoiceAddress1", th.StringType),
+    ("invoiceAddress2", th.StringType),
+    ("invoiceAddress3", th.StringType),
+    ("invoicePostalCode", th.StringType),
+    ("invoiceCity", th.StringType),
+    ("invoiceState", th.StringType),
+    ("invoiceCountryId", th.StringType),
+]
+
+
 class ReportsOrderHeadersStream(ExtendStream):
     """Extend Commerce order headers from the Reports API.
 
-    Iterates day by day (changeDate == toChangeDate) from start_date to today,
-    paginating all pages within each day before advancing.
+    Iterates day by day from start_date to today, requesting the full-day
+    window (00:00:00 through 23:59:59) and paginating all pages within each day
+    before advancing.
 
     Pagination: pageNumber (1-based), stop when currentPage == totalPages.
     Replication key: changeDate.
@@ -1209,17 +1417,10 @@ class ReportsOrderHeadersStream(ExtendStream):
     replication_method = "INCREMENTAL"
 
     schema = th.PropertiesList(
-        th.Property("orderNumber", th.StringType),
-        th.Property("orderNumberExternal", th.StringType),
-        th.Property("orderType", th.StringType),
-        th.Property("orderStatus", th.StringType),
-        th.Property("orderDate", th.DateTimeType),
-        th.Property("customerNumber", th.StringType),
-        th.Property("customerName", th.StringType),
-        th.Property("totalPrice", th.NumberType),
-        th.Property("currency", th.StringType),
-        th.Property("warehouse", th.StringType),
-        th.Property("changeDate", th.DateTimeType),
+        *(
+            th.Property(field_name, field_type)
+            for field_name, field_type in _REPORTS_ORDER_HEADER_FIELDS
+        )
     ).to_dict()
 
     @property
@@ -1228,30 +1429,31 @@ class ReportsOrderHeadersStream(ExtendStream):
         return f"{api_url}/reports/{self.config['client']}/OrderHeaders"
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        reports_start_date, reports_end_date = _report_state_date_range(self)
         start_replication = self.get_starting_replication_key_value(context)
-        if start_replication:
+        if reports_start_date:
+            start_date = reports_start_date
+        elif start_replication:
             start_date = str(start_replication)[:10]
         elif self.config.get("start_date"):
             start_date = str(self.config["start_date"])[:10]
         else:
             start_date = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
 
-        end_date = str(self.config["end_date"])[:10] if self.config.get("end_date") else None
-
-        for item in _iter_report_days(self, self._reports_url, "orderHeaderList", start_date, end_date):
-            yield {
-                "orderNumber": item.get("orderNumber"),
-                "orderNumberExternal": item.get("orderNumberExternal"),
-                "orderType": item.get("orderType"),
-                "orderStatus": item.get("orderStatus"),
-                "orderDate": item.get("orderDate"),
-                "customerNumber": str(item.get("customerNumber") or ""),
-                "customerName": item.get("customerName"),
-                "totalPrice": item.get("totalPrice"),
-                "currency": item.get("currency"),
-                "warehouse": item.get("warehouse"),
-                "changeDate": item.get("changeDate"),
+        for item in _iter_report_days(
+            self,
+            self._reports_url,
+            "orderHeaderList",
+            start_date,
+            reports_end_date or self.sync_upper_bound_date,
+        ):
+            _log_unmapped_report_fields(self.name, item, _REPORTS_ORDER_HEADER_FIELDS)
+            record = {
+                field_name: item.get(field_name)
+                for field_name, _field_type in _REPORTS_ORDER_HEADER_FIELDS
             }
+            record["customerNumber"] = str(record.get("customerNumber") or "")
+            yield record
 
 
 # ---------------------------------------------------------------------------
@@ -1259,35 +1461,89 @@ class ReportsOrderHeadersStream(ExtendStream):
 # ---------------------------------------------------------------------------
 
 
+_REPORTS_ORDER_ROW_FIELDS = [
+    ("orderRowId", th.StringType),
+    ("position", th.IntegerType),
+    ("subPosition", th.IntegerType),
+    ("supplyMode", th.StringType),
+    ("productNumber", th.StringType),
+    ("productName", th.StringType),
+    ("productUnitName", th.StringType),
+    ("orderQuantity", th.NumberType),
+    ("price", th.NumberType),
+    ("vatPercent", th.NumberType),
+    ("currencyId", th.StringType),
+    ("currencyExchangeRate", th.NumberType),
+    ("expectedDeliveryDate", th.DateTimeType),
+    ("shipDate", th.DateTimeType),
+    ("backOrderHandling", th.StringType),
+    ("notes", th.StringType),
+    ("orderRowStatus", th.StringType),
+    ("shipmentNumber", th.StringType),
+    ("warehouseShortName", th.StringType),
+    ("orderNumber", th.StringType),
+    ("productNotes", th.StringType),
+    ("handlingMark", th.StringType),
+    ("shippingMark", th.StringType),
+    ("batchNumber", th.StringType),
+    ("salesUnit", th.StringType),
+    ("salesUnitQuantity", th.NumberType),
+    ("agreedOrderPickTime", th.DateTimeType),
+    ("pickingDelayReasonId", th.StringType),
+    ("listPrice", th.NumberType),
+    ("ordinalPrice", th.NumberType),
+    ("promotion", th.StringType),
+    ("isResultOfPromotion", th.BooleanType),
+    ("deliveredQuantity", th.NumberType),
+    ("waitReservation", th.BooleanType),
+    ("requestedBatchNo", th.StringType),
+    ("productSalesUnitPrice", th.NumberType),
+    ("productVisibility", th.StringType),
+    ("numberOfOrdersCreatedFromSubscription", th.IntegerType),
+    ("maxNumberOfOrdersToCreateFromSubscription", th.IntegerType),
+    ("explicitCost", th.NumberType),
+    ("explicitCostCurrency", th.StringType),
+    ("originalExpectedDeliveryDate", th.DateTimeType),
+    ("project", th.StringType),
+    ("orderReasonCode", th.StringType),
+    ("structuredCost", th.NumberType),
+    ("exciseDutyCost", th.NumberType),
+    ("customerBonusCost", th.NumberType),
+    ("cost", th.NumberType),
+    ("parentOrderRowPosition", th.IntegerType),
+    ("agreeedOrderRowId", th.StringType),
+    ("orderDate", th.DateTimeType),
+    ("orderPriority", th.IntegerType),
+    ("getBalanceFromAgreedOrder", th.BooleanType),
+    ("gtin", th.StringType),
+    ("allocationStatus", th.StringType),
+    ("releaseToWarehouseWhenAllocated", th.BooleanType),
+    ("pickDate", th.DateTimeType),
+    ("changeDate", th.DateTimeType),
+]
+
+
 class ReportsOrderRowsStream(ExtendStream):
     """Extend Commerce order rows from the Reports API.
 
-    Iterates day by day (changeDate == toChangeDate) from start_date to today,
-    paginating all pages within each day before advancing.
+    Iterates day by day from start_date to today, requesting the full-day
+    window (00:00:00 through 23:59:59) and paginating all pages within each day
+    before advancing.
 
     Pagination: pageNumber (1-based), stop when currentPage == totalPages.
     Replication key: changeDate.
     """
 
     name = "reports_order_rows"
-    primary_keys = ["orderNumber", "position"]
+    primary_keys = ["orderRowId"]
     replication_key = "changeDate"
     replication_method = "INCREMENTAL"
 
     schema = th.PropertiesList(
-        th.Property("orderNumber", th.StringType),
-        th.Property("position", th.IntegerType),
-        th.Property("orderRowStatus", th.StringType),
-        th.Property("productNumber", th.StringType),
-        th.Property("productName", th.StringType),
-        th.Property("supplierProductNumber", th.StringType),
-        th.Property("quantity", th.NumberType),
-        th.Property("unitPrice", th.NumberType),
-        th.Property("vatPercent", th.NumberType),
-        th.Property("currency", th.StringType),
-        th.Property("warehouse", th.StringType),
-        th.Property("expectedDeliveryDate", th.DateTimeType),
-        th.Property("changeDate", th.DateTimeType),
+        *(
+            th.Property(field_name, field_type)
+            for field_name, field_type in _REPORTS_ORDER_ROW_FIELDS
+        )
     ).to_dict()
 
     @property
@@ -1296,30 +1552,26 @@ class ReportsOrderRowsStream(ExtendStream):
         return f"{api_url}/reports/{self.config['client']}/OrderRows"
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        reports_start_date, reports_end_date = _report_state_date_range(self)
         start_replication = self.get_starting_replication_key_value(context)
-        if start_replication:
+        if reports_start_date:
+            start_date = reports_start_date
+        elif start_replication:
             start_date = str(start_replication)[:10]
         elif self.config.get("start_date"):
             start_date = str(self.config["start_date"])[:10]
         else:
             start_date = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
 
-        end_date = str(self.config["end_date"])[:10] if self.config.get("end_date") else None
-
-        for item in _iter_report_days(self, self._reports_url, "orderRowList", start_date, end_date):
+        for item in _iter_report_days(
+            self,
+            self._reports_url,
+            "orderRowList",
+            start_date,
+            reports_end_date or self.sync_upper_bound_date,
+        ):
+            _log_unmapped_report_fields(self.name, item, _REPORTS_ORDER_ROW_FIELDS)
             yield {
-                "orderNumber": item.get("orderNumber"),
-                "position": item.get("position"),
-                "orderRowStatus": item.get("orderRowStatus"),
-                "productNumber": item.get("productNumber"),
-                "productName": item.get("productName"),
-                "supplierProductNumber": item.get("supplierProductNumber"),
-                "quantity": item.get("quantity"),
-                "unitPrice": item.get("unitPrice"),
-                "vatPercent": item.get("vatPercent"),
-                "currency": item.get("currency"),
-                "warehouse": item.get("warehouse"),
-                "expectedDeliveryDate": item.get("expectedDeliveryDate"),
-                "changeDate": item.get("changeDate"),
+                field_name: item.get(field_name)
+                for field_name, _field_type in _REPORTS_ORDER_ROW_FIELDS
             }
-
