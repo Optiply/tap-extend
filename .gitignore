@@ -10,8 +10,8 @@
 AGENTS.md
 catalog.json
 config.json
-data.jsonl
-job.log
+data*.jsonl
+job*.log
 state.json
 .codex/
 .venv/
