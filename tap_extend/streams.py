@@ -118,6 +118,28 @@ class ExtendStream(Stream):
         """Return the YYYY-MM-DD date for the current tap run upper bound."""
         return self.sync_upper_bound[:10]
 
+    @staticmethod
+    def _format_extend_datetime(value: Any) -> str:
+        """Format a datetime-like value for Extend query params without timezone."""
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+
+        text_value = str(value)
+        if text_value.endswith("Z"):
+            text_value = text_value[:-1] + "+00:00"
+
+        try:
+            parsed = datetime.fromisoformat(text_value)
+        except ValueError:
+            return str(value)
+
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+        return parsed.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
     @property
     def request_timeout(self) -> float:
         """Per-request timeout in seconds. Default 120, configurable via request_timeout_seconds."""
@@ -1008,10 +1030,10 @@ class PurchaseOrdersStream(ExtendStream):
 
         params_base: dict[str, Any] = {}
         if start_replication:
-            params_base["createDateFrom"] = str(start_replication)
+            params_base["createDateFrom"] = self._format_extend_datetime(start_replication)
         elif self.config.get("start_date"):
-            params_base["createDateFrom"] = str(self.config["start_date"])
-        params_base["createDateTo"] = self.sync_upper_bound
+            params_base["createDateFrom"] = self._format_extend_datetime(self.config["start_date"])
+        params_base["createDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
 
         page = 1
         while True:

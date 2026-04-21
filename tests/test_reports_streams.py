@@ -509,3 +509,41 @@ def test_top_level_reports_state_range_takes_precedence(monkeypatch):
         "start_date": "2026-03-01",
         "end_date": "2026-03-31",
     }]
+
+
+def test_purchase_orders_uses_naive_extend_datetime_params(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-20T17:18:46+00:00"
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2026-04-20T00:00:00Z",
+        }
+        warehouse_codes = None
+
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return {
+                    "purchaseOrderList": [],
+                    "paginationInfo": {"currentPage": 1, "totalPages": 1},
+                }
+
+        return Response()
+
+    stream = stream_module.PurchaseOrdersStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    assert list(stream.get_records()) == []
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/PurchaseOrders",
+        "params": {
+            "createDateFrom": "2026-04-20T00:00:00",
+            "createDateTo": "2026-04-20T17:18:46",
+            "pageNumber": 1,
+        },
+    }]
