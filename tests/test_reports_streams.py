@@ -511,7 +511,7 @@ def test_top_level_reports_state_range_takes_precedence(monkeypatch):
     }]
 
 
-def test_purchase_orders_uses_naive_extend_datetime_params(monkeypatch):
+def test_purchase_orders_uses_change_date_datetime_range(monkeypatch):
     class Tap:
         _extend_sync_upper_bound = "2026-04-20T17:18:46+00:00"
         config = {
@@ -542,8 +542,60 @@ def test_purchase_orders_uses_naive_extend_datetime_params(monkeypatch):
     assert captured == [{
         "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/PurchaseOrders",
         "params": {
-            "createDateFrom": "2026-04-20T00:00:00",
-            "createDateTo": "2026-04-20T17:18:46",
+            "changeDateFrom": "2026-04-20T00:00:00",
+            "changeDateTo": "2026-04-20T17:18:46",
             "pageNumber": 1,
         },
     }]
+
+
+def test_purchase_orders_missing_detail_400_falls_back_to_summary(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-22T11:20:00+00:00"
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2026-04-22T00:00:00Z",
+        }
+        warehouse_codes = None
+
+    purchase_summary = {
+        "purchaseNumber": "RP-404",
+        "status": "Ordered",
+        "createDate": "2026-04-22T10:49:27.887+02:00",
+        "warehouse": "TESTWH",
+        "isOpen": True,
+        "isReceived": False,
+        "externalOrderNumber": "",
+        "supplierNumber": "109",
+        "supplierName": "Supplier Example",
+        "supplierOrderNumber": "",
+        "shippedDate": None,
+        "changeDate": "2026-04-22T10:50:46.963",
+    }
+
+    def fake_request(url, params=None):
+        if url.endswith("/PurchaseOrders"):
+            return FakeResponse(
+                {
+                    "purchaseOrderList": [purchase_summary],
+                    "paginationInfo": {"currentPage": 1, "totalPages": 1},
+                }
+            )
+        response = FakeHTTPResponse(
+            400,
+            '{"Message": "Error getting purchase order: There is no row at position 0."}',
+        )
+        response.raise_for_status()
+        raise AssertionError("unreachable")
+
+    stream = stream_module.PurchaseOrdersStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records())
+
+    assert len(records) == 1
+    assert records[0]["purchaseNumber"] == "RP-404"
+    assert records[0]["rows"] == "[]"
+    assert records[0]["shipments"] == "[]"
+    assert records[0]["supplierAgreementNumber"] is None

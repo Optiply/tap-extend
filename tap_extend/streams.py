@@ -119,6 +119,13 @@ class ExtendStream(Stream):
         return self.sync_upper_bound[:10]
 
     @staticmethod
+    def _next_day(date_str: str) -> str:
+        """Return the next day for a YYYY-MM-DD string."""
+        return (
+            datetime.strptime(date_str[:10], "%Y-%m-%d") + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+
+    @staticmethod
     def _format_extend_datetime(value: Any) -> str:
         """Format a datetime-like value for Extend query params without timezone."""
         if isinstance(value, datetime):
@@ -966,9 +973,9 @@ class PurchaseOrdersStream(ExtendStream):
     Detail endpoint is called per PO for header (incl. supplierAgreementNumber),
     rows, and shipments.
 
-    Incremental via createDateFrom.
+    Incremental via changeDateFrom/changeDateTo.
     Pagination: pageNumber (1-based).
-    Replication key: createDate (from PurchaseOrderListItem).
+    Replication key: changeDate (from PurchaseOrderListItem).
 
     Schema from PurchaseOrderListItem + PurchaseOrderSupplier +
     PurchaseOrderRow definitions.
@@ -976,7 +983,7 @@ class PurchaseOrdersStream(ExtendStream):
 
     name = "purchase_orders"
     primary_keys = ["purchaseNumber"]
-    replication_key = "createDate"
+    replication_key = "changeDate"
     replication_method = "INCREMENTAL"
 
     schema = th.PropertiesList(
@@ -990,6 +997,7 @@ class PurchaseOrdersStream(ExtendStream):
         th.Property("externalOrderNumber", th.StringType),
         th.Property("supplierOrderNumber", th.StringType),
         th.Property("shippedDate", th.DateTimeType),
+        th.Property("changeDate", th.DateTimeType),
         # PurchaseOrderSupplier fields (from detail header)
         th.Property("supplierNumber", th.StringType),
         th.Property("supplierName", th.StringType),
@@ -1030,13 +1038,24 @@ class PurchaseOrdersStream(ExtendStream):
 
         params_base: dict[str, Any] = {}
         if start_replication:
-            params_base["createDateFrom"] = self._format_extend_datetime(start_replication)
+            params_base["changeDateFrom"] = self._format_extend_datetime(start_replication)
         elif self.config.get("start_date"):
-            params_base["createDateFrom"] = self._format_extend_datetime(self.config["start_date"])
-        params_base["createDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
+            params_base["changeDateFrom"] = self._format_extend_datetime(self.config["start_date"])
+        else:
+            params_base["changeDateFrom"] = self._format_extend_datetime(self.sync_upper_bound)
+        params_base["changeDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
 
         page = 1
+        total_emitted = 0
+        total_detail_fallbacks = 0
         while True:
+            page_started_at = time.monotonic()
+            logger.info(
+                "Requesting PurchaseOrders page %d: changeDateFrom=%s changeDateTo=%s",
+                page,
+                params_base["changeDateFrom"],
+                params_base["changeDateTo"],
+            )
             data = self._request(
                 f"{self.base_url}/PurchaseOrders",
                 params={**params_base, "pageNumber": page},
@@ -1044,6 +1063,15 @@ class PurchaseOrdersStream(ExtendStream):
 
             po_list = data.get("purchaseOrderList", [])
             pagination = data.get("paginationInfo", {})
+            current_page = int(pagination.get("currentPage") or page)
+            total_pages = int(pagination.get("totalPages") or 0)
+            logger.info(
+                "PurchaseOrders page %d/%d returned %d list records in %.1fs",
+                current_page,
+                total_pages,
+                len(po_list),
+                time.monotonic() - page_started_at,
+            )
 
             if not po_list:
                 break
@@ -1055,20 +1083,42 @@ class PurchaseOrdersStream(ExtendStream):
                 if warehouse_codes and po.get("warehouse") not in warehouse_codes:
                     continue
 
+                logger.info("Requesting PurchaseOrder details: %s", purchase_number)
                 detail = self._fetch_detail(purchase_number)
                 if detail:
+                    total_emitted += 1
                     yield self._map_detail(detail, po)
                 else:
+                    total_emitted += 1
+                    total_detail_fallbacks += 1
                     yield self._map_summary(po)
 
-            total_pages = pagination.get("totalPages", 0)
             if page >= total_pages:
                 break
             page += 1
 
+        logger.info(
+            "PurchaseOrders done: emitted %d records (%d summary-only fallbacks)",
+            total_emitted,
+            total_detail_fallbacks,
+        )
+
     def _fetch_detail(self, purchase_number: str) -> Optional[dict]:
         try:
             return self._request(f"{self.base_url}/PurchaseOrders/{purchase_number}").json()
+        except requests.exceptions.HTTPError as exc:
+            response = exc.response
+            message = (response.text or "").lower() if response is not None else ""
+            if response is not None and response.status_code == 400 and (
+                "there is no row at position 0" in message
+            ):
+                logger.info(
+                    "Purchase order detail unavailable for %s; falling back to summary only.",
+                    purchase_number,
+                )
+                return None
+            logger.warning("Failed to fetch detail for PO %s", purchase_number, exc_info=True)
+            return None
         except Exception:
             logger.warning("Failed to fetch detail for PO %s", purchase_number, exc_info=True)
             return None
@@ -1091,6 +1141,7 @@ class PurchaseOrdersStream(ExtendStream):
             "externalOrderNumber": header.get("externalOrderNumber") or summary.get("externalOrderNumber", ""),
             "supplierOrderNumber": header.get("supplierOrderNumber") or summary.get("supplierOrderNumber", ""),
             "shippedDate": header.get("shippedDate") or summary.get("shippedDate"),
+            "changeDate": header.get("changeDate") or summary.get("changeDate"),
             # PurchaseOrderSupplier
             "supplierNumber": supplier.get("supplierNumber") or summary.get("supplierNumber"),
             "supplierName": supplier.get("supplierName") or summary.get("supplierName"),
@@ -1132,6 +1183,7 @@ class PurchaseOrdersStream(ExtendStream):
             "externalOrderNumber": summary.get("externalOrderNumber", ""),
             "supplierOrderNumber": summary.get("supplierOrderNumber", ""),
             "shippedDate": summary.get("shippedDate"),
+            "changeDate": summary.get("changeDate"),
             "supplierNumber": summary.get("supplierNumber"),
             "supplierName": summary.get("supplierName"),
             "supplierAgreementNumber": None,
