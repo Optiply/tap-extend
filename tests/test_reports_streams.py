@@ -599,3 +599,184 @@ def test_purchase_orders_missing_detail_400_falls_back_to_summary(monkeypatch):
     assert records[0]["rows"] == "[]"
     assert records[0]["shipments"] == "[]"
     assert records[0]["supplierAgreementNumber"] is None
+
+
+def test_supplier_agreements_uses_change_date_datetime_range_and_maps_new_fields(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2026-04-22T02:00:00Z",
+        }
+
+    sample = {
+        "name": "Agreement Example",
+        "customsLeadTime": 0.0,
+        "transportLeadTime": 40.0,
+        "deliveryMethod": "Carrier Example",
+        "forwarderCustomerNumber": "",
+        "paymentTerms": "100%",
+        "penalty": "",
+        "ordererAddress1": "Address Example",
+        "ordererPostalCode": "12345",
+        "ordererCity": "City Example",
+        "ordererCountryId": "CN",
+        "incoterms": "EXW",
+        "transportConditionDescription": None,
+        "currencyId": "USD",
+        "makeAutomaticPurchase": False,
+        "purchaseNotificationSystem": "Manual",
+        "manufacturingLeadTime": 80.0,
+        "useRowBasedLeadTime": False,
+        "validFrom": None,
+        "validTo": None,
+        "active": True,
+        "supplierAgreementNumber": 879127612,
+        "capacity": None,
+        "authorizationNumber": None,
+        "latitude": None,
+        "longitude": None,
+        "internalContact": "Contact Example",
+        "externalContact": " ",
+        "purchaseNotificationAddress": "",
+        "changeDate": "2026-04-22T12:49:35.677",
+        "supplierAgreementId": "agreement-id-1",
+    }
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return {
+                    "SupplierAgreementList": [sample],
+                    "paginationInfo": {"currentPage": 1, "totalPages": 1},
+                }
+
+        return Response()
+
+    stream = stream_module.SupplierAgreementsStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records())
+
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/SupplierAgreement",
+        "params": {
+            "active": "true",
+            "changeDateFrom": "2026-04-22T02:00:00",
+            "changeDateTo": "2026-04-22T14:00:00",
+            "pageNumber": 1,
+        },
+    }]
+    assert records == [{
+        "supplierAgreementNumber": 879127612,
+        "supplierAgreementId": "agreement-id-1",
+        "name": "Agreement Example",
+        "active": True,
+        "currencyId": "USD",
+        "manufacturingLeadTime": 80.0,
+        "transportLeadTime": 40.0,
+        "customsLeadTime": 0.0,
+        "paymentTerms": "100%",
+        "deliveryMethod": "Carrier Example",
+        "forwarderCustomerNumber": "",
+        "penalty": "",
+        "incoterms": "EXW",
+        "transportConditionDescription": None,
+        "purchaseNotificationSystem": "Manual",
+        "useRowBasedLeadTime": False,
+        "validFrom": None,
+        "validTo": None,
+        "ordererAddress1": "Address Example",
+        "ordererPostalCode": "12345",
+        "ordererCity": "City Example",
+        "ordererCountryId": "CN",
+        "makeAutomaticPurchase": False,
+        "capacity": None,
+        "authorizationNumber": None,
+        "latitude": None,
+        "longitude": None,
+        "internalContact": "Contact Example",
+        "externalContact": " ",
+        "purchaseNotificationAddress": "",
+        "changeDate": "2026-04-22T12:49:35.677",
+    }]
+
+
+def test_product_supplier_agreements_maps_change_date(monkeypatch):
+    class Tap:
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+        }
+
+    sample = {
+        "productNumber": "SKU-1",
+        "supplierAgreementNumber": 101,
+        "supplierAgreementName": "Agreement Example",
+        "supplierName": "Supplier Example",
+        "supplierAgreementCurrencyId": "USD",
+        "supplierProductNumber": "SUP-1",
+        "supplierProductName": "Supplier Product Example",
+        "price": 10.5,
+        "vatPercent": 25.0,
+        "manufacturingLeadTimeHour": 24.0,
+        "supplierAgreementProductionLeadtimeHours": 12,
+        "supplierAgreementTransportLeadtimeHours": 36,
+        "inactive": False,
+        "statisticalNumber": "123",
+        "country": "CN",
+        "productUnitId": "ST",
+        "useOtherPurchaseUnit": False,
+        "purchaseProductUnit": "BOX",
+        "quantityPerPurchaseProductUnit": 5.0,
+        "changeDate": "2026-04-22T12:49:35.677",
+    }
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return {
+                    "productSupplierAgreementList": [sample],
+                    "paginationInfo": {"currentPage": 1, "totalPages": 1},
+                }
+
+        return Response()
+
+    stream = stream_module.ProductSupplierAgreementsStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records())
+
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/ProductSupplierAgreements",
+        "params": {"pageNumber": 1},
+    }]
+    assert records == [{
+        "productNumber": "SKU-1",
+        "supplierAgreementNumber": 101,
+        "supplierAgreementName": "Agreement Example",
+        "supplierName": "Supplier Example",
+        "supplierAgreementCurrencyId": "USD",
+        "supplierProductNumber": "SUP-1",
+        "supplierProductName": "Supplier Product Example",
+        "price": 10.5,
+        "vatPercent": 25.0,
+        "manufacturingLeadTimeHour": 24.0,
+        "supplierAgreementProductionLeadtimeHours": 12,
+        "supplierAgreementTransportLeadtimeHours": 36,
+        "inactive": False,
+        "statisticalNumber": "123",
+        "country": "CN",
+        "productUnitId": "ST",
+        "useOtherPurchaseUnit": False,
+        "purchaseProductUnit": "BOX",
+        "quantityPerPurchaseProductUnit": 5.0,
+        "changeDate": "2026-04-22T12:49:35.677",
+    }]

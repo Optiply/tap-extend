@@ -395,18 +395,21 @@ class SupplierAgreementsStream(ExtendStream):
 
     Filters active=true per Xavier's requirements (2026-03-06 email).
 
-    Schema from SupplierAgreementListItem definition.
-    FULL_TABLE — no change-date filter available on this endpoint.
+    Schema from SupplierAgreementListItem definition plus newer fields returned
+    by the updated API contract.
+    INCREMENTAL via changeDateFrom/changeDateTo.
     Pagination: pageNumber (1-based).
     Response wrapper key: SupplierAgreementList.
     """
 
     name = "supplier_agreements"
     primary_keys = ["supplierAgreementNumber"]
-    replication_method = "FULL_TABLE"
+    replication_key = "changeDate"
+    replication_method = "INCREMENTAL"
 
     schema = th.PropertiesList(
         th.Property("supplierAgreementNumber", th.IntegerType),
+        th.Property("supplierAgreementId", th.StringType),
         th.Property("name", th.StringType),
         # supplierNumber (FK to Supplier) only on detail endpoint — not in list response
         th.Property("active", th.BooleanType),
@@ -416,7 +419,12 @@ class SupplierAgreementsStream(ExtendStream):
         th.Property("customsLeadTime", th.NumberType),
         th.Property("paymentTerms", th.StringType),
         th.Property("deliveryMethod", th.StringType),
+        th.Property("forwarderCustomerNumber", th.StringType),
+        th.Property("penalty", th.StringType),
         th.Property("incoterms", th.StringType),
+        th.Property("transportConditionDescription", th.StringType),
+        th.Property("purchaseNotificationSystem", th.StringType),
+        th.Property("useRowBasedLeadTime", th.BooleanType),
         th.Property("validFrom", th.DateTimeType),
         th.Property("validTo", th.DateTimeType),
         th.Property("ordererAddress1", th.StringType),
@@ -425,21 +433,54 @@ class SupplierAgreementsStream(ExtendStream):
         th.Property("ordererCountryId", th.StringType),
         th.Property("makeAutomaticPurchase", th.BooleanType),
         th.Property("capacity", th.IntegerType),
+        th.Property("authorizationNumber", th.StringType),
+        th.Property("latitude", th.StringType),
+        th.Property("longitude", th.StringType),
+        th.Property("internalContact", th.StringType),
+        th.Property("externalContact", th.StringType),
+        th.Property("purchaseNotificationAddress", th.StringType),
+        th.Property("changeDate", th.DateTimeType),
     ).to_dict()
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        start_replication = self.get_starting_replication_key_value(context)
+        params_base: dict[str, Any] = {"active": "true"}
+        if start_replication:
+            params_base["changeDateFrom"] = self._format_extend_datetime(start_replication)
+        elif self.config.get("start_date"):
+            params_base["changeDateFrom"] = self._format_extend_datetime(self.config["start_date"])
+        params_base["changeDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
+
         page = 1
         while True:
+            page_started_at = time.monotonic()
+            logger.info(
+                "Requesting SupplierAgreement page %d: active=%s changeDateFrom=%s changeDateTo=%s",
+                page,
+                params_base["active"],
+                params_base.get("changeDateFrom"),
+                params_base["changeDateTo"],
+            )
             data = self._request(
                 f"{self.base_url}/SupplierAgreement",
-                params={"pageNumber": page, "active": "true"},
+                params={**params_base, "pageNumber": page},
             ).json()
             items = data.get("SupplierAgreementList", [])
             pagination = data.get("paginationInfo", {})
+            current_page = int(pagination.get("currentPage") or page)
+            total_pages = int(pagination.get("totalPages") or 0)
+            logger.info(
+                "SupplierAgreement page %d/%d returned %d records in %.1fs",
+                current_page,
+                total_pages,
+                len(items),
+                time.monotonic() - page_started_at,
+            )
 
             for a in items:
                 yield {
                     "supplierAgreementNumber": a.get("supplierAgreementNumber"),
+                    "supplierAgreementId": a.get("supplierAgreementId"),
                     "name": a.get("name"),
                     "active": a.get("active"),
                     "currencyId": a.get("currencyId"),
@@ -448,7 +489,12 @@ class SupplierAgreementsStream(ExtendStream):
                     "customsLeadTime": a.get("customsLeadTime"),
                     "paymentTerms": a.get("paymentTerms"),
                     "deliveryMethod": a.get("deliveryMethod"),
+                    "forwarderCustomerNumber": a.get("forwarderCustomerNumber"),
+                    "penalty": a.get("penalty"),
                     "incoterms": a.get("incoterms"),
+                    "transportConditionDescription": a.get("transportConditionDescription"),
+                    "purchaseNotificationSystem": a.get("purchaseNotificationSystem"),
+                    "useRowBasedLeadTime": a.get("useRowBasedLeadTime"),
                     "validFrom": a.get("validFrom"),
                     "validTo": a.get("validTo"),
                     "ordererAddress1": a.get("ordererAddress1"),
@@ -457,9 +503,15 @@ class SupplierAgreementsStream(ExtendStream):
                     "ordererCountryId": a.get("ordererCountryId"),
                     "makeAutomaticPurchase": a.get("makeAutomaticPurchase"),
                     "capacity": a.get("capacity"),
+                    "authorizationNumber": a.get("authorizationNumber"),
+                    "latitude": str(a.get("latitude")) if a.get("latitude") is not None else None,
+                    "longitude": str(a.get("longitude")) if a.get("longitude") is not None else None,
+                    "internalContact": a.get("internalContact"),
+                    "externalContact": a.get("externalContact"),
+                    "purchaseNotificationAddress": a.get("purchaseNotificationAddress"),
+                    "changeDate": a.get("changeDate"),
                 }
 
-            total_pages = pagination.get("totalPages", 0)
             if page >= total_pages:
                 break
             page += 1
@@ -506,6 +558,7 @@ class ProductSupplierAgreementsStream(ExtendStream):
         th.Property("useOtherPurchaseUnit", th.BooleanType),
         th.Property("purchaseProductUnit", th.StringType),
         th.Property("quantityPerPurchaseProductUnit", th.NumberType),
+        th.Property("changeDate", th.DateTimeType),
     ).to_dict()
 
     def _map(self, a: dict) -> dict:
@@ -529,10 +582,12 @@ class ProductSupplierAgreementsStream(ExtendStream):
             "useOtherPurchaseUnit": a.get("useOtherPurchaseUnit"),
             "purchaseProductUnit": a.get("purchaseProductUnit"),
             "quantityPerPurchaseProductUnit": a.get("quantityPerPurchaseProductUnit"),
+            "changeDate": a.get("changeDate"),
         }
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
         url = f"{self.base_url}/ProductSupplierAgreements"
+        total_emitted = 0
 
         # Try global paginated list first
         try:
@@ -541,19 +596,25 @@ class ProductSupplierAgreementsStream(ExtendStream):
                 data = self._request(url, params={"pageNumber": page}).json()
                 items = data.get("productSupplierAgreementList", [])
                 pagination = data.get("paginationInfo", {})
+                total_pages = int(pagination.get("totalPages") or 0)
                 for a in items:
+                    total_emitted += 1
                     yield self._map(a)
-                total_pages = pagination.get("totalPages", 0)
                 if page >= total_pages:
                     break
                 page += 1
+            logger.info(
+                "ProductSupplierAgreements done via global list: emitted %d records across %d pages",
+                total_emitted,
+                page,
+            )
             return
         except requests.exceptions.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 400:
                 raise
             logger.warning(
                 "ProductSupplierAgreements: global list returned 400 — "
-                "falling back to per-supplierAgreement iteration"
+                "falling back to per-product iteration"
             )
 
         # Fallback: iterate by productNumber (fewer calls than supplierAgreementNumber)
@@ -578,9 +639,11 @@ class ProductSupplierAgreementsStream(ExtendStream):
                         psa_data = self._request(
                             url, params={"productNumber": pn, "pageNumber": psa_page}
                         ).json()
-                        for a in psa_data.get("productSupplierAgreementList", []):
+                        psa_items = psa_data.get("productSupplierAgreementList", [])
+                        psa_total = int(psa_data.get("paginationInfo", {}).get("totalPages", 0) or 0)
+                        for a in psa_items:
+                            total_emitted += 1
                             yield self._map(a)
-                        psa_total = psa_data.get("paginationInfo", {}).get("totalPages", 0)
                         if psa_page >= psa_total:
                             break
                         psa_page += 1
@@ -590,7 +653,12 @@ class ProductSupplierAgreementsStream(ExtendStream):
                 break
             p_offset += 1
 
-        logger.info("ProductSupplierAgreements: per-product iteration done (%d products)", len(seen_products))
+        logger.info(
+            "ProductSupplierAgreements: per-product iteration done (%d products, %d records, %d product pages)",
+            len(seen_products),
+            total_emitted,
+            p_offset + 1,
+        )
 
 
 # ---------------------------------------------------------------------------
