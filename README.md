@@ -18,7 +18,7 @@ Developed and maintained by [Optiply](mailto:dev@optiply.com) · License: Apache
 |---|---|---|
 | `SuppliersStream` | `GET /Supplier` | FULL_TABLE |
 | `SupplierAgreementsStream` | `GET /SupplierAgreement` | FULL_TABLE (active=true) |
-| `ProductSupplierAgreementsStream` | `GET /ProductSupplierAgreements` | INCREMENTAL child of `SupplierAgreementsStream` (`supplierAgreementNumber`, `changeDateFrom`, `changeDateTo`) |
+| `ProductSupplierAgreementsStream` | `GET /ProductSupplierAgreements` | INCREMENTAL child of `SupplierAgreementsStream` (first run unfiltered, later runs use `supplierAgreementNumber`, `changeDateFrom`, `changeDateTo`) |
 | `ProductsStream` | `GET /Products` | INCREMENTAL (`modifiedDateFrom`) |
 | `ProductAvailabilityStream` | `GET /ProductAvailability` | INCREMENTAL (`modifiedDateFrom`) |
 | `CustomerOrdersStream` | `GET /CustomerOrders` | INCREMENTAL (`modifiedDateFrom`) |

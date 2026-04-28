@@ -532,8 +532,13 @@ class ProductSupplierAgreementsStream(ExtendStream):
     call that was previously embedded in ProductsStream.
 
     INCREMENTAL child stream: loops ProductSupplierAgreements once per
-    supplierAgreementNumber emitted by SupplierAgreementsStream, using a stable
-    changeDateFrom/changeDateTo window for the whole tap run.
+    supplierAgreementNumber emitted by SupplierAgreementsStream.
+
+    First run: no changeDateFrom/changeDateTo filters, so the endpoint returns
+    the full supplier agreement mapping set.
+
+    Subsequent runs: use a stable tap-run changeDateTo plus the saved bookmark
+    as changeDateFrom.
     Pagination: pageNumber (1-based).
     Response wrapper key: productSupplierAgreementList.
     """
@@ -611,6 +616,21 @@ class ProductSupplierAgreementsStream(ExtendStream):
         target_state["replication_key"] = self.replication_key
         target_state["replication_key_value"] = self.get_replication_key_signpost(None)
 
+    def _increment_stream_state(
+        self, latest_record: dict[str, Any], *, context: Optional[dict] = None
+    ) -> None:
+        """Skip SDK bookmark comparisons for legacy rows missing changeDate."""
+        if latest_record.get(self.replication_key) in (None, ""):
+            logger.debug(
+                "Skipping state increment for ProductSupplierAgreements row without %s "
+                "(supplierAgreementNumber=%s, productNumber=%s)",
+                self.replication_key,
+                latest_record.get("supplierAgreementNumber"),
+                latest_record.get("productNumber"),
+            )
+            return
+        super()._increment_stream_state(latest_record, context=context)
+
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
         supplier_agreement_number = (context or {}).get("supplierAgreementNumber")
         if supplier_agreement_number in (None, ""):
@@ -621,16 +641,16 @@ class ProductSupplierAgreementsStream(ExtendStream):
 
         url = f"{self.base_url}/ProductSupplierAgreements"
         total_emitted = 0
-        bookmark_upper_bound = self.get_replication_key_signpost(context)
-        start_replication = self.get_starting_replication_key_value(context)
+        current_state = self.get_context_state(context)
+        start_replication = None
+        if current_state.get("replication_key") == self.replication_key:
+            start_replication = current_state.get("replication_key_value")
         params_base: dict[str, Any] = {
             "supplierAgreementNumber": supplier_agreement_number,
-            "changeDateTo": bookmark_upper_bound,
         }
         if start_replication:
             params_base["changeDateFrom"] = self._format_extend_datetime(start_replication)
-        elif self.config.get("start_date"):
-            params_base["changeDateFrom"] = self._format_extend_datetime(self.config["start_date"])
+            params_base["changeDateTo"] = self.get_replication_key_signpost(context)
 
         try:
             page = 1
@@ -642,7 +662,7 @@ class ProductSupplierAgreementsStream(ExtendStream):
                     supplier_agreement_number,
                     page,
                     params_base.get("changeDateFrom"),
-                    params_base["changeDateTo"],
+                    params_base.get("changeDateTo"),
                 )
                 data = self._request(url, params={**params_base, "pageNumber": page}).json()
                 items = data.get("productSupplierAgreementList", [])
