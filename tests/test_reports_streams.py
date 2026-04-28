@@ -911,3 +911,128 @@ def test_product_supplier_agreements_skips_state_increment_for_null_change_date(
     })
 
     assert stream.stream_state == before_state
+
+
+def test_products_first_run_ignores_start_date_until_bookmark_exists(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
+        state = {"bookmarks": {"products": {}}}
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2010-01-01T00:00:00Z",
+        }
+
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return [{
+                    "productNumber": "SKU-1",
+                    "productName": "Product Example",
+                    "createDate": "2026-04-22T12:49:35.677",
+                    "productUnit": "PCS",
+                    "cost": 10.0,
+                    "currency": "USD",
+                    "countryOfOrigin": "CN",
+                    "supplyMode": "Stocked",
+                    "manufacturer": "Maker",
+                    "manufacturerProductNumber": "M-1",
+                    "gtinNumberList": "123",
+                    "enabled": True,
+                    "statisticalCategory1": "A",
+                    "statisticalCategory2": "B",
+                    "statisticalCategory3": "C",
+                    "productGroupsAndCategories": {"companyGroup": "Group", "financialCategory": "Cat"},
+                    "warehouse": "WH1",
+                    "availableBalance": 5,
+                }]
+
+        return Response()
+
+    stream = stream_module.ProductsStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records())
+    stream.finalize_state_progress_markers()
+
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products",
+        "params": {
+            "pageCount": 100,
+            "pageOffset": 0,
+        },
+    }]
+    assert records == [{
+        "productNumber": "SKU-1",
+        "productName": "Product Example",
+        "createDate": "2026-04-22T12:49:35.677",
+        "productUnit": "PCS",
+        "cost": 10.0,
+        "currency": "USD",
+        "countryOfOrigin": "CN",
+        "supplyMode": "Stocked",
+        "manufacturer": "Maker",
+        "manufacturerProductNumber": "M-1",
+        "gtinNumberList": "123",
+        "enabled": True,
+        "statisticalCategory1": "A",
+        "statisticalCategory2": "B",
+        "statisticalCategory3": "C",
+        "companyGroup": "Group",
+        "financialCategory": "Cat",
+        "modifiedDate": None,
+        "warehouse_stock": '[{"warehouse": "WH1", "availableBalance": 5}]',
+    }]
+    assert stream.stream_state["replication_key"] == "modifiedDate"
+    assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"
+
+
+def test_products_subsequent_run_uses_bookmark_window(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
+        state = {
+            "bookmarks": {
+                "products": {
+                    "replication_key": "modifiedDate",
+                    "replication_key_value": "2026-04-21T10:00:00",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+        }
+
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return []
+
+        return Response()
+
+    stream = stream_module.ProductsStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records())
+    stream.finalize_state_progress_markers()
+
+    assert records == []
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/Products",
+        "params": {
+            "pageCount": 100,
+            "pageOffset": 0,
+            "modifiedDateFrom": "2026-04-21T10:00:00",
+            "modifiedDateTo": "2026-04-22T14:00:00",
+        },
+    }]
+    assert stream.stream_state["replication_key"] == "modifiedDate"
+    assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"

@@ -4,7 +4,7 @@ Streams:
   - SuppliersStream:                  GET /Supplier                  (FULL_TABLE)
   - SupplierAgreementsStream:         GET /SupplierAgreement         (FULL_TABLE, active=true)
   - ProductSupplierAgreementsStream:  GET /ProductSupplierAgreements (INCREMENTAL child of supplier_agreements)
-  - ProductsStream:                   GET /Products                  (INCREMENTAL, modifiedDateFrom)
+  - ProductsStream:                   GET /Products                  (INCREMENTAL, first run unfiltered then modifiedDateFrom/modifiedDateTo)
   - ProductAvailabilityStream:        GET /ProductAvailability       (INCREMENTAL, modifiedDateFrom)
   - CustomerOrdersStream:             GET /CustomerOrders            (INCREMENTAL, modifiedDateFrom)
   - PurchaseOrdersStream:             GET /PurchaseOrders            (INCREMENTAL, createDateFrom)
@@ -718,16 +718,24 @@ class ProductsStream(ExtendStream):
     Supplier-product links are handled by ProductSupplierAgreementsStream
     (GET /ProductSupplierAgreements) — no per-product detail calls needed here.
 
-    Incremental via modifiedDateFrom server-side filter.
+    Incremental via modifiedDateFrom/modifiedDateTo server-side filters.
     Pagination: pageCount + pageOffset (NOT pageNumber).
-    Replication key: createDate (only date field present on list response).
+
+    First run: no modifiedDate filters, so the endpoint returns the full
+    product set.
+
+    Subsequent runs: use a stable tap-run modifiedDateTo plus the saved
+    bookmark as modifiedDateFrom.
+
+    The endpoint does not expose a record-level modifiedDate field, so the
+    incremental bookmark is signpost-based rather than derived from each row.
 
     Schema from ProductListItem definition.
     """
 
     name = "products"
     primary_keys = ["productNumber"]
-    replication_key = "createDate"
+    replication_key = "modifiedDate"
     replication_method = "INCREMENTAL"
 
     schema = th.PropertiesList(
@@ -749,21 +757,41 @@ class ProductsStream(ExtendStream):
         th.Property("statisticalCategory3", th.StringType),
         th.Property("companyGroup", th.StringType),
         th.Property("financialCategory", th.StringType),
+        th.Property("modifiedDate", th.DateTimeType),
         # Aggregated per-warehouse stock as JSON: [{warehouse, availableBalance}]
         th.Property("warehouse_stock", th.StringType),
     ).to_dict()
+
+    def get_replication_key_signpost(self, context: Optional[dict]) -> Optional[str]:
+        """Freeze bookmark advancement to the tap-run upper bound."""
+        return self._format_extend_datetime(self.sync_upper_bound)
+
+    def finalize_state_progress_markers(self, state: Optional[dict] = None) -> None:
+        """Persist the tap-run upper bound even when records lack modifiedDate."""
+        if state in (None, {}):
+            for context in self.partitions or [{}]:
+                finalize_sdk_state_progress_markers(self.get_context_state(context or None))
+            target_state = self.stream_state
+        else:
+            finalize_sdk_state_progress_markers(state)
+            target_state = state
+        target_state["replication_key"] = self.replication_key
+        target_state["replication_key_value"] = self.get_replication_key_signpost(None)
+
+    def _increment_stream_state(
+        self, latest_record: dict[str, Any], *, context: Optional[dict] = None
+    ) -> None:
+        """Products bookmarks are signpost-based, not row-derived."""
+        return
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
         seen: dict[str, dict] = {}
         stock_map: dict[str, list] = {}
 
-        start_replication = self.get_starting_replication_key_value(context)
-        if start_replication:
-            modified_date_from = str(start_replication)
-        elif self.config.get("start_date"):
-            modified_date_from = str(self.config["start_date"])
-        else:
-            modified_date_from = None
+        current_state = self.get_context_state(context)
+        start_replication = None
+        if current_state.get("replication_key") == self.replication_key:
+            start_replication = current_state.get("replication_key_value")
 
         page_offset = 0
         page_count = 100
@@ -771,9 +799,9 @@ class ProductsStream(ExtendStream):
 
         while True:
             params: dict[str, Any] = {"pageCount": page_count, "pageOffset": page_offset}
-            if modified_date_from:
-                params["modifiedDateFrom"] = modified_date_from
-            params["modifiedDateTo"] = self.sync_upper_bound
+            if start_replication:
+                params["modifiedDateFrom"] = self._format_extend_datetime(start_replication)
+                params["modifiedDateTo"] = self.get_replication_key_signpost(context)
 
             try:
                 product_list = self._request(
@@ -825,6 +853,7 @@ class ProductsStream(ExtendStream):
                         "statisticalCategory3": p.get("statisticalCategory3"),
                         "companyGroup": groups.get("companyGroup"),
                         "financialCategory": groups.get("financialCategory"),
+                        "modifiedDate": p.get("modifiedDate"),
                     }
 
             if len(product_list) < page_count:
