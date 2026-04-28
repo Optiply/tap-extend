@@ -3,7 +3,7 @@
 Streams:
   - SuppliersStream:                  GET /Supplier                  (FULL_TABLE)
   - SupplierAgreementsStream:         GET /SupplierAgreement         (FULL_TABLE, active=true)
-  - ProductSupplierAgreementsStream:  GET /ProductSupplierAgreements (FULL_TABLE)
+  - ProductSupplierAgreementsStream:  GET /ProductSupplierAgreements (INCREMENTAL child of supplier_agreements)
   - ProductsStream:                   GET /Products                  (INCREMENTAL, modifiedDateFrom)
   - ProductAvailabilityStream:        GET /ProductAvailability       (INCREMENTAL, modifiedDateFrom)
   - CustomerOrdersStream:             GET /CustomerOrders            (INCREMENTAL, modifiedDateFrom)
@@ -35,6 +35,15 @@ import requests
 
 from hotglue_singer_sdk import typing as th
 from hotglue_singer_sdk.streams import Stream
+
+try:
+    from hotglue_singer_sdk.helpers._state import (
+        finalize_state_progress_markers as finalize_sdk_state_progress_markers,
+    )
+except ImportError:  # pragma: no cover - test stubs only
+    def finalize_sdk_state_progress_markers(stream_or_partition_state: dict) -> None:
+        """Fallback no-op when tests stub only the minimal SDK surface."""
+        return None
 
 try:
     from hotglue_singer_sdk.exceptions import InvalidCredentialsError
@@ -397,15 +406,14 @@ class SupplierAgreementsStream(ExtendStream):
 
     Schema from SupplierAgreementListItem definition plus newer fields returned
     by the updated API contract.
-    INCREMENTAL via changeDateFrom/changeDateTo.
+    FULL_TABLE parent stream for ProductSupplierAgreementsStream.
     Pagination: pageNumber (1-based).
     Response wrapper key: SupplierAgreementList.
     """
 
     name = "supplier_agreements"
     primary_keys = ["supplierAgreementNumber"]
-    replication_key = "changeDate"
-    replication_method = "INCREMENTAL"
+    replication_method = "FULL_TABLE"
 
     schema = th.PropertiesList(
         th.Property("supplierAgreementNumber", th.IntegerType),
@@ -442,25 +450,19 @@ class SupplierAgreementsStream(ExtendStream):
         th.Property("changeDate", th.DateTimeType),
     ).to_dict()
 
+    def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
+        supplier_agreement_number = record.get("supplierAgreementNumber")
+        if supplier_agreement_number is None:
+            return context or {}
+        return {"supplierAgreementNumber": supplier_agreement_number}
+
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        start_replication = self.get_starting_replication_key_value(context)
         params_base: dict[str, Any] = {"active": "true"}
-        if start_replication:
-            params_base["changeDateFrom"] = self._format_extend_datetime(start_replication)
-        elif self.config.get("start_date"):
-            params_base["changeDateFrom"] = self._format_extend_datetime(self.config["start_date"])
-        params_base["changeDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
 
         page = 1
         while True:
             page_started_at = time.monotonic()
-            logger.info(
-                "Requesting SupplierAgreement page %d: active=%s changeDateFrom=%s changeDateTo=%s",
-                page,
-                params_base["active"],
-                params_base.get("changeDateFrom"),
-                params_base["changeDateTo"],
-            )
+            logger.info("Requesting SupplierAgreement page %d: active=%s", page, params_base["active"])
             data = self._request(
                 f"{self.base_url}/SupplierAgreement",
                 params={**params_base, "pageNumber": page},
@@ -529,14 +531,18 @@ class ProductSupplierAgreementsStream(ExtendStream):
     source for Optiply SupplierProducts — replaces the per-product detail
     call that was previously embedded in ProductsStream.
 
-    FULL_TABLE — no date filter available on this endpoint.
+    INCREMENTAL child stream: loops ProductSupplierAgreements once per
+    supplierAgreementNumber emitted by SupplierAgreementsStream, using a stable
+    changeDateFrom/changeDateTo window for the whole tap run.
     Pagination: pageNumber (1-based).
     Response wrapper key: productSupplierAgreementList.
     """
 
     name = "product_supplier_agreements"
+    parent_stream_type = SupplierAgreementsStream
     primary_keys = ["productNumber", "supplierAgreementNumber"]
-    replication_method = "FULL_TABLE"
+    replication_key = "changeDate"
+    replication_method = "INCREMENTAL"
 
     schema = th.PropertiesList(
         th.Property("productNumber", th.StringType),
@@ -585,79 +591,95 @@ class ProductSupplierAgreementsStream(ExtendStream):
             "changeDate": a.get("changeDate"),
         }
 
+    def _get_state_partition_context(self, context: Optional[dict]) -> Optional[dict]:
+        """Keep one global bookmark across all supplierAgreementNumber child syncs."""
+        return None
+
+    def get_replication_key_signpost(self, context: Optional[dict]) -> Optional[str]:
+        """Freeze bookmark advancement to the tap-run upper bound."""
+        return self._format_extend_datetime(self.sync_upper_bound)
+
+    def finalize_state_progress_markers(self, state: Optional[dict] = None) -> None:
+        """Persist the tap-run upper bound even when no child request emits records."""
+        if state in (None, {}):
+            for context in self.partitions or [{}]:
+                finalize_sdk_state_progress_markers(self.get_context_state(context or None))
+            target_state = self.stream_state
+        else:
+            finalize_sdk_state_progress_markers(state)
+            target_state = state
+        target_state["replication_key"] = self.replication_key
+        target_state["replication_key_value"] = self.get_replication_key_signpost(None)
+
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        supplier_agreement_number = (context or {}).get("supplierAgreementNumber")
+        if supplier_agreement_number in (None, ""):
+            raise ValueError(
+                "ProductSupplierAgreementsStream requires supplierAgreementNumber context "
+                "from SupplierAgreementsStream."
+            )
+
         url = f"{self.base_url}/ProductSupplierAgreements"
         total_emitted = 0
+        bookmark_upper_bound = self.get_replication_key_signpost(context)
+        start_replication = self.get_starting_replication_key_value(context)
+        params_base: dict[str, Any] = {
+            "supplierAgreementNumber": supplier_agreement_number,
+            "changeDateTo": bookmark_upper_bound,
+        }
+        if start_replication:
+            params_base["changeDateFrom"] = self._format_extend_datetime(start_replication)
+        elif self.config.get("start_date"):
+            params_base["changeDateFrom"] = self._format_extend_datetime(self.config["start_date"])
 
-        # Try global paginated list first
         try:
             page = 1
             while True:
-                data = self._request(url, params={"pageNumber": page}).json()
+                page_started_at = time.monotonic()
+                logger.info(
+                    "Requesting ProductSupplierAgreements supplierAgreementNumber=%s page=%d "
+                    "changeDateFrom=%s changeDateTo=%s",
+                    supplier_agreement_number,
+                    page,
+                    params_base.get("changeDateFrom"),
+                    params_base["changeDateTo"],
+                )
+                data = self._request(url, params={**params_base, "pageNumber": page}).json()
                 items = data.get("productSupplierAgreementList", [])
                 pagination = data.get("paginationInfo", {})
+                current_page = int(pagination.get("currentPage") or page)
                 total_pages = int(pagination.get("totalPages") or 0)
+                logger.info(
+                    "ProductSupplierAgreements supplierAgreementNumber=%s page %d/%d returned "
+                    "%d records in %.1fs",
+                    supplier_agreement_number,
+                    current_page,
+                    total_pages,
+                    len(items),
+                    time.monotonic() - page_started_at,
+                )
+
                 for a in items:
                     total_emitted += 1
                     yield self._map(a)
+
                 if page >= total_pages:
                     break
                 page += 1
-            logger.info(
-                "ProductSupplierAgreements done via global list: emitted %d records across %d pages",
-                total_emitted,
-                page,
-            )
-            return
         except requests.exceptions.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 400:
                 raise
             logger.warning(
-                "ProductSupplierAgreements: global list returned 400 — "
-                "falling back to per-product iteration"
+                "ProductSupplierAgreements: supplierAgreementNumber=%s returned 400, "
+                "skipping child sync (%s)",
+                supplier_agreement_number,
+                exc,
             )
 
-        # Fallback: iterate by productNumber (fewer calls than supplierAgreementNumber)
-        seen_products: set = set()
-        p_offset = 0
-        p_count = 100
-        while True:
-            product_list = self._request(
-                f"{self.base_url}/Products",
-                params={"pageCount": p_count, "pageOffset": p_offset},
-            ).json()
-            if not isinstance(product_list, list) or not product_list:
-                break
-            for p in product_list:
-                pn = str(p.get("productNumber") or "")
-                if not pn or pn in seen_products:
-                    continue
-                seen_products.add(pn)
-                try:
-                    psa_page = 1
-                    while True:
-                        psa_data = self._request(
-                            url, params={"productNumber": pn, "pageNumber": psa_page}
-                        ).json()
-                        psa_items = psa_data.get("productSupplierAgreementList", [])
-                        psa_total = int(psa_data.get("paginationInfo", {}).get("totalPages", 0) or 0)
-                        for a in psa_items:
-                            total_emitted += 1
-                            yield self._map(a)
-                        if psa_page >= psa_total:
-                            break
-                        psa_page += 1
-                except requests.exceptions.HTTPError as e:
-                    logger.warning("PSA: skipping productNumber=%s (%s)", pn, e)
-            if len(product_list) < p_count:
-                break
-            p_offset += 1
-
         logger.info(
-            "ProductSupplierAgreements: per-product iteration done (%d products, %d records, %d product pages)",
-            len(seen_products),
+            "ProductSupplierAgreements done for supplierAgreementNumber=%s: emitted %d records",
+            supplier_agreement_number,
             total_emitted,
-            p_offset + 1,
         )
 
 

@@ -46,7 +46,7 @@ class TapExtend(Tap):
     Streams:
       - suppliers                     FULL_TABLE  GET /Supplier
       - supplier_agreements           FULL_TABLE  GET /SupplierAgreement (active=true)
-      - product_supplier_agreements   FULL_TABLE  GET /ProductSupplierAgreements
+      - product_supplier_agreements   INCREMENTAL GET /ProductSupplierAgreements (child of supplier_agreements)
       - products                      INCREMENTAL GET /Products (modifiedDateFrom)
       - product_availability          INCREMENTAL GET /ProductAvailability (modifiedDateFrom)
       - customer_orders               INCREMENTAL GET /CustomerOrders (modifiedDateFrom)

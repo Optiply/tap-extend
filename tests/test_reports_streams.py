@@ -30,9 +30,18 @@ def install_hotglue_sdk_stubs():
             self._tap = tap
             self.config = getattr(tap, "config", {}) if tap is not None else {}
             self.logger = getattr(tap, "logger", None)
+            self.tap_state = getattr(tap, "state", {}) if tap is not None else {}
+            self.stream_state = self.tap_state.setdefault("bookmarks", {}).setdefault(
+                getattr(self, "name", self.__class__.__name__),
+                {},
+            )
+            self.partitions = None
 
         def get_starting_replication_key_value(self, context):
-            return None
+            return self.stream_state.get("replication_key_value")
+
+        def get_context_state(self, context):
+            return self.stream_state
 
     for name in [
         "StringType",
@@ -603,7 +612,6 @@ def test_purchase_orders_missing_detail_400_falls_back_to_summary(monkeypatch):
 
 def test_supplier_agreements_uses_change_date_datetime_range_and_maps_new_fields(monkeypatch):
     class Tap:
-        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
         config = {
             "api_url": "https://api.example.test/RESTAPI",
             "client": "TESTCLIENT",
@@ -666,8 +674,6 @@ def test_supplier_agreements_uses_change_date_datetime_range_and_maps_new_fields
         "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/SupplierAgreement",
         "params": {
             "active": "true",
-            "changeDateFrom": "2026-04-22T02:00:00",
-            "changeDateTo": "2026-04-22T14:00:00",
             "pageNumber": 1,
         },
     }]
@@ -704,13 +710,16 @@ def test_supplier_agreements_uses_change_date_datetime_range_and_maps_new_fields
         "purchaseNotificationAddress": "",
         "changeDate": "2026-04-22T12:49:35.677",
     }]
+    assert stream.get_child_context(records[0], None) == {"supplierAgreementNumber": 879127612}
 
 
 def test_product_supplier_agreements_maps_change_date(monkeypatch):
     class Tap:
+        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
         config = {
             "api_url": "https://api.example.test/RESTAPI",
             "client": "TESTCLIENT",
+            "start_date": "2026-04-22T02:00:00Z",
         }
 
     sample = {
@@ -752,11 +761,16 @@ def test_product_supplier_agreements_maps_change_date(monkeypatch):
     stream = stream_module.ProductSupplierAgreementsStream(tap=Tap())
     monkeypatch.setattr(stream, "_request", fake_request)
 
-    records = list(stream.get_records())
+    records = list(stream.get_records({"supplierAgreementNumber": 101}))
 
     assert captured == [{
         "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/ProductSupplierAgreements",
-        "params": {"pageNumber": 1},
+        "params": {
+            "supplierAgreementNumber": 101,
+            "changeDateFrom": "2026-04-22T02:00:00",
+            "changeDateTo": "2026-04-22T14:00:00",
+            "pageNumber": 1,
+        },
     }]
     assert records == [{
         "productNumber": "SKU-1",
@@ -780,3 +794,55 @@ def test_product_supplier_agreements_maps_change_date(monkeypatch):
         "quantityPerPurchaseProductUnit": 5.0,
         "changeDate": "2026-04-22T12:49:35.677",
     }]
+    assert stream.parent_stream_type is stream_module.SupplierAgreementsStream
+
+
+def test_product_supplier_agreements_uses_bookmark_and_persists_run_upper_bound(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
+        state = {
+            "bookmarks": {
+                "product_supplier_agreements": {
+                    "replication_key": "changeDate",
+                    "replication_key_value": "2026-04-22T10:00:00",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2026-04-20T00:00:00Z",
+        }
+
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return {
+                    "productSupplierAgreementList": [],
+                    "paginationInfo": {"currentPage": 1, "totalPages": 1},
+                }
+
+        return Response()
+
+    stream = stream_module.ProductSupplierAgreementsStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records({"supplierAgreementNumber": 202}))
+    stream.finalize_state_progress_markers()
+
+    assert records == []
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/ProductSupplierAgreements",
+        "params": {
+            "supplierAgreementNumber": 202,
+            "changeDateFrom": "2026-04-22T10:00:00",
+            "changeDateTo": "2026-04-22T14:00:00",
+            "pageNumber": 1,
+        },
+    }]
+    assert stream.stream_state["replication_key"] == "changeDate"
+    assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"
