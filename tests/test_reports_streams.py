@@ -179,8 +179,8 @@ def test_request_caps_unusually_high_rate_limit_headers(monkeypatch):
     stream._request(url)
 
     bucket = "v1_0:TESTCLIENT:ProductSupplierAgreements"
-    assert stream_module.ExtendStream._rate_limit_requests_per_second[bucket] == 4.0
-    assert clock["sleeps"] == [0.25]
+    assert stream_module.ExtendStream._rate_limit_requests_per_second[bucket] == 15.0
+    assert clock["sleeps"] == [1 / 15.0]
 
 
 def test_request_defers_exhausted_bucket_until_reset(monkeypatch):
