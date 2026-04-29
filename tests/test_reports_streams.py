@@ -2,6 +2,8 @@ import importlib
 import sys
 import types
 
+import pytest
+
 
 def install_hotglue_sdk_stubs():
     """Provide the tiny SDK surface needed to import stream definitions."""
@@ -66,6 +68,13 @@ install_hotglue_sdk_stubs()
 stream_module = importlib.import_module("tap_extend.streams")
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limit_state():
+    stream_module.ExtendStream._next_request_at = 0.0
+    stream_module.ExtendStream._rate_limit_next_request_at = {}
+    stream_module.ExtendStream._rate_limit_requests_per_second = {}
+
+
 class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -80,11 +89,13 @@ class FakeRequest:
 
 
 class FakeHTTPResponse:
-    def __init__(self, status_code, text="", headers=None):
+    def __init__(self, status_code, text="", headers=None, url=None):
         self.status_code = status_code
         self.text = text
         self.headers = headers or {}
         self.request = FakeRequest()
+        if url is not None:
+            self.request = types.SimpleNamespace(method="GET", url=url)
         self.url = self.request.url
 
     def raise_for_status(self):
@@ -119,6 +130,87 @@ DEADLOCK_BODY = (
 )
 
 
+def install_fake_clock(monkeypatch):
+    clock = {"monotonic": 0.0, "epoch": 1_777_454_000.0, "sleeps": []}
+
+    def sleep(seconds):
+        clock["sleeps"].append(seconds)
+        clock["monotonic"] += seconds
+        clock["epoch"] += seconds
+
+    monkeypatch.setattr(stream_module.time, "monotonic", lambda: clock["monotonic"])
+    monkeypatch.setattr(stream_module.time, "time", lambda: clock["epoch"])
+    monkeypatch.setattr(stream_module.time, "sleep", sleep)
+    return clock
+
+
+def test_request_learns_report_rate_limit_from_headers(monkeypatch):
+    class Tap:
+        config = {"request_timeout_seconds": 10}
+
+    clock = install_fake_clock(monkeypatch)
+    url = "https://api.example.test/RESTAPI/reports/TESTCLIENT/OrderRows"
+    stream = stream_module.ExtendStream(tap=Tap())
+    stream._session = FakeSession([
+        FakeHTTPResponse(200, "{}", {"x-ratelimit-limit": "60", "x-ratelimit-remaining": "59"}, url),
+        FakeHTTPResponse(200, "{}", {"x-ratelimit-limit": "60", "x-ratelimit-remaining": "58"}, url),
+    ])
+
+    stream._request(url)
+    stream._request(url)
+
+    assert stream_module.ExtendStream._rate_limit_requests_per_second["reports:TESTCLIENT"] == 1.0
+    assert clock["sleeps"] == [1.0]
+
+
+def test_request_caps_unusually_high_rate_limit_headers(monkeypatch):
+    class Tap:
+        config = {"request_timeout_seconds": 10}
+
+    clock = install_fake_clock(monkeypatch)
+    url = "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/ProductSupplierAgreements"
+    stream = stream_module.ExtendStream(tap=Tap())
+    stream._session = FakeSession([
+        FakeHTTPResponse(200, "{}", {"x-ratelimit-limit": "1000000", "x-ratelimit-remaining": "999999"}, url),
+        FakeHTTPResponse(200, "{}", {"x-ratelimit-limit": "1000000", "x-ratelimit-remaining": "999998"}, url),
+    ])
+
+    stream._request(url)
+    stream._request(url)
+
+    bucket = "v1_0:TESTCLIENT:ProductSupplierAgreements"
+    assert stream_module.ExtendStream._rate_limit_requests_per_second[bucket] == 4.0
+    assert clock["sleeps"] == [0.25]
+
+
+def test_request_defers_exhausted_bucket_until_reset(monkeypatch):
+    class Tap:
+        config = {"request_timeout_seconds": 10}
+
+    clock = install_fake_clock(monkeypatch)
+    url = "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/PurchaseOrders/RP-1"
+    reset_epoch = clock["epoch"] + 30.0
+    stream = stream_module.ExtendStream(tap=Tap())
+    stream._session = FakeSession([
+        FakeHTTPResponse(
+            200,
+            "{}",
+            {
+                "x-ratelimit-limit": "300",
+                "x-ratelimit-remaining": "0",
+                "x-ratelimit-reset": str(reset_epoch),
+            },
+            url,
+        ),
+        FakeHTTPResponse(200, "{}", {"x-ratelimit-limit": "300", "x-ratelimit-remaining": "299"}, url),
+    ])
+
+    stream._request(url)
+    stream._request(url)
+
+    assert clock["sleeps"] == [31.0]
+
+
 def test_request_retries_transient_extend_400s_every_configured_wait(monkeypatch):
     class Tap:
         config = {
@@ -130,7 +222,7 @@ def test_request_retries_transient_extend_400s_every_configured_wait(monkeypatch
     monkeypatch.setattr(stream_module.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     stream = stream_module.ExtendStream(tap=Tap())
-    monkeypatch.setattr(stream, "_apply_client_throttle", lambda: None)
+    monkeypatch.setattr(stream, "_apply_client_throttle", lambda url=None: None)
     session = FakeSession([
         FakeHTTPResponse(400, DEADLOCK_BODY),
         FakeHTTPResponse(400, DEADLOCK_BODY),
@@ -160,7 +252,7 @@ def test_request_can_limit_transient_extend_400_attempts(monkeypatch):
     monkeypatch.setattr(stream_module, "RETRYABLE_CLIENT_ERROR_MAX_ATTEMPTS", 2)
 
     stream = stream_module.ExtendStream(tap=Tap())
-    monkeypatch.setattr(stream, "_apply_client_throttle", lambda: None)
+    monkeypatch.setattr(stream, "_apply_client_throttle", lambda url=None: None)
     session = FakeSession([
         FakeHTTPResponse(400, DEADLOCK_BODY),
         FakeHTTPResponse(400, DEADLOCK_BODY),

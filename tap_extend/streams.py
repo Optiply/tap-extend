@@ -55,6 +55,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 REQUESTS_PER_SECOND = 4.0
+MIN_REQUESTS_PER_SECOND = 0.1
+MAX_REQUESTS_PER_SECOND = 4.0
+SECONDS_PER_RATE_LIMIT_WINDOW = 60.0
 RETRYABLE_CLIENT_ERROR_WAIT_SECONDS = 10.0
 RETRYABLE_CLIENT_ERROR_MAX_ATTEMPTS = 0  # 0 means retry indefinitely.
 _LOGGED_UNMAPPED_REPORT_FIELDS: set[tuple[str, tuple[str, ...]]] = set()
@@ -62,6 +65,11 @@ _LOGGED_UNMAPPED_REPORT_FIELDS: set[tuple[str, tuple[str, ...]]] = set()
 
 class _RetryableError(Exception):
     """Raised for errors that should trigger backoff retry (429, 5xx)."""
+
+
+def _remaining_requests_label(response: requests.Response) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    return headers.get("x-ratelimit-remaining", "unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +81,9 @@ class ExtendStream(Stream):
     """Base class for all Extend Commerce streams."""
 
     _session: Optional[requests.Session] = None
-    _next_request_at = 0.0
+    _next_request_at = 0.0  # Backwards-compatible fallback for tests/older call sites.
+    _rate_limit_next_request_at: dict[str, float] = {}
+    _rate_limit_requests_per_second: dict[str, float] = {}
 
     @property
     def session(self) -> requests.Session:
@@ -102,7 +112,12 @@ class ExtendStream(Stream):
 
     @property
     def requests_per_second(self) -> float:
-        return max(REQUESTS_PER_SECOND, 0.1)
+        configured = self.config.get("max_requests_per_second", MAX_REQUESTS_PER_SECOND)
+        try:
+            configured_rate = float(configured)
+        except (TypeError, ValueError):
+            configured_rate = MAX_REQUESTS_PER_SECOND
+        return max(min(configured_rate, MAX_REQUESTS_PER_SECOND), MIN_REQUESTS_PER_SECOND)
 
     @property
     def sync_upper_bound(self) -> str:
@@ -175,14 +190,106 @@ class ExtendStream(Stream):
         """Max attempts for transient Extend 400s. 0 means retry indefinitely."""
         return RETRYABLE_CLIENT_ERROR_MAX_ATTEMPTS
 
-    def _apply_client_throttle(self) -> None:
-        min_interval = 1.0 / self.requests_per_second
+    def _rate_limit_bucket(self, url: str) -> str:
+        """Return the shared rate-limit bucket for an Extend URL.
+
+        Extend exposes different limits for endpoint families, and those limits may vary
+        per customer. Detail/list routes for the same resource are treated as one bucket;
+        reports are treated as one shared bucket because OrderHeaders and OrderRows
+        responses expose the same reset window.
+        """
+        path = url.split("?", 1)[0].rstrip("/")
+        marker = "/RESTAPI/"
+        if marker in path:
+            path = path.split(marker, 1)[1]
+        parts = [part for part in path.split("/") if part]
+
+        if parts and parts[0].lower() == "reports":
+            client = parts[1] if len(parts) > 1 else self.config.get("client", "")
+            return f"reports:{client}"
+
+        if len(parts) >= 3 and parts[0].lower() == "v1_0":
+            client = parts[1]
+            resource = parts[2]
+            singular_resources = {
+                "Product": "Products",
+                "SupplierAgreement": "SupplierAgreements",
+                "PurchaseOrder": "PurchaseOrders",
+            }
+            resource = singular_resources.get(resource, resource)
+            return f"v1_0:{client}:{resource}"
+
+        return path
+
+    def _bucket_requests_per_second(self, bucket: str) -> float:
+        return ExtendStream._rate_limit_requests_per_second.get(bucket, self.requests_per_second)
+
+    def _apply_client_throttle(self, url: Optional[str] = None) -> None:
+        bucket = self._rate_limit_bucket(url) if url else "default"
+        min_interval = 1.0 / self._bucket_requests_per_second(bucket)
         now = time.monotonic()
-        sleep_for = ExtendStream._next_request_at - now
+        next_request_at = ExtendStream._rate_limit_next_request_at.get(
+            bucket,
+            ExtendStream._next_request_at if bucket == "default" else 0.0,
+        )
+        sleep_for = next_request_at - now
         if sleep_for > 0:
             time.sleep(sleep_for)
             now = time.monotonic()
-        ExtendStream._next_request_at = max(ExtendStream._next_request_at, now) + min_interval
+        ExtendStream._rate_limit_next_request_at[bucket] = max(next_request_at, now) + min_interval
+        if bucket == "default":
+            ExtendStream._next_request_at = ExtendStream._rate_limit_next_request_at[bucket]
+
+    def _remaining_requests_label(self, response: requests.Response) -> str:
+        return _remaining_requests_label(response)
+
+    def _update_rate_limit_from_response(self, response: requests.Response) -> None:
+        request_url = getattr(response, "url", None) or getattr(
+            getattr(response, "request", None), "url", ""
+        )
+        if not request_url:
+            return
+
+        bucket = self._rate_limit_bucket(request_url)
+        limit_value = response.headers.get("x-ratelimit-limit")
+        if limit_value:
+            try:
+                header_requests_per_second = float(limit_value) / SECONDS_PER_RATE_LIMIT_WINDOW
+            except (TypeError, ValueError):
+                header_requests_per_second = None
+            if header_requests_per_second and header_requests_per_second > 0:
+                effective_rate = min(
+                    max(header_requests_per_second, MIN_REQUESTS_PER_SECOND),
+                    self.requests_per_second,
+                )
+                previous_rate = ExtendStream._rate_limit_requests_per_second.get(bucket)
+                ExtendStream._rate_limit_requests_per_second[bucket] = effective_rate
+                ExtendStream._rate_limit_next_request_at[bucket] = max(
+                    ExtendStream._rate_limit_next_request_at.get(bucket, 0.0),
+                    time.monotonic() + (1.0 / effective_rate),
+                )
+                if previous_rate != effective_rate:
+                    logger.info(
+                        "Rate limit bucket %s using %.3f requests/sec from x-ratelimit-limit=%s",
+                        bucket,
+                        effective_rate,
+                        limit_value,
+                    )
+
+        remaining_value = response.headers.get("x-ratelimit-remaining")
+        try:
+            remaining_is_exhausted = remaining_value is not None and float(remaining_value) <= 0
+        except (TypeError, ValueError):
+            remaining_is_exhausted = False
+        if remaining_is_exhausted:
+            delay_seconds = self._delay_from_reset_header(response)
+            if delay_seconds:
+                logger.info(
+                    "Rate limit bucket %s exhausted; deferring next request %.1fs until reset.",
+                    bucket,
+                    delay_seconds,
+                )
+                self._defer_next_request(delay_seconds, bucket=bucket)
 
     def _delay_from_retry_after(self, retry_after: Optional[str]) -> Optional[float]:
         if not retry_after:
@@ -206,12 +313,24 @@ class ExtendStream(Stream):
             return None
         return max(reset_epoch - time.time(), 0.0) + 1.0
 
-    def _defer_next_request(self, delay_seconds: Optional[float]) -> None:
+    def _defer_next_request(self, delay_seconds: Optional[float], bucket: Optional[str] = None) -> None:
         if not delay_seconds or delay_seconds <= 0:
             return
+        defer_until = time.monotonic() + delay_seconds
+        if bucket:
+            ExtendStream._rate_limit_next_request_at[bucket] = max(
+                ExtendStream._rate_limit_next_request_at.get(bucket, 0.0),
+                defer_until,
+            )
+            return
+
         ExtendStream._next_request_at = max(
             ExtendStream._next_request_at,
-            time.monotonic() + delay_seconds,
+            defer_until,
+        )
+        ExtendStream._rate_limit_next_request_at["default"] = max(
+            ExtendStream._rate_limit_next_request_at.get("default", 0.0),
+            ExtendStream._next_request_at,
         )
 
     def _is_retryable_client_error(self, response: requests.Response) -> bool:
@@ -238,8 +357,9 @@ class ExtendStream(Stream):
         retryable_client_error_attempt = 0
 
         while True:
-            self._apply_client_throttle()
+            self._apply_client_throttle(url)
             response = self.session.get(url, params=params, timeout=self.request_timeout)
+            self._update_rate_limit_from_response(response)
 
             if response.status_code == 401:
                 raise InvalidCredentialsError(
@@ -254,8 +374,8 @@ class ExtendStream(Stream):
                     30.0,
                 )
                 logger.warning("Rate limited (429). Sleeping %.1fs.", delay_seconds)
+                self._defer_next_request(delay_seconds, bucket=self._rate_limit_bucket(url))
                 time.sleep(delay_seconds)
-                self._defer_next_request(delay_seconds)
                 raise _RetryableError("Rate limited (429)")
             if response.status_code >= 500:
                 raise _RetryableError(
@@ -291,9 +411,6 @@ class ExtendStream(Stream):
                 response.text[:300],
             )
             time.sleep(wait_seconds)
-
-        if response.headers.get("x-ratelimit-remaining") == "0":
-            self._defer_next_request(self._delay_from_reset_header(response))
 
         # 4xx (except 429 handled above) are client errors — log body for diagnosis, then fail
         if response.status_code >= 400:
@@ -463,20 +580,22 @@ class SupplierAgreementsStream(ExtendStream):
         while True:
             page_started_at = time.monotonic()
             logger.info("Requesting SupplierAgreement page %d: active=%s", page, params_base["active"])
-            data = self._request(
+            response = self._request(
                 f"{self.base_url}/SupplierAgreement",
                 params={**params_base, "pageNumber": page},
-            ).json()
+            )
+            data = response.json()
             items = data.get("SupplierAgreementList", [])
             pagination = data.get("paginationInfo", {})
             current_page = int(pagination.get("currentPage") or page)
             total_pages = int(pagination.get("totalPages") or 0)
             logger.info(
-                "SupplierAgreement page %d/%d returned %d records in %.1fs",
+                "SupplierAgreement page %d/%d returned %d records in %.1fs remaining_requests=%s",
                 current_page,
                 total_pages,
                 len(items),
                 time.monotonic() - page_started_at,
+                self._remaining_requests_label(response),
             )
 
             for a in items:
@@ -664,19 +783,21 @@ class ProductSupplierAgreementsStream(ExtendStream):
                     params_base.get("changeDateFrom"),
                     params_base.get("changeDateTo"),
                 )
-                data = self._request(url, params={**params_base, "pageNumber": page}).json()
+                response = self._request(url, params={**params_base, "pageNumber": page})
+                data = response.json()
                 items = data.get("productSupplierAgreementList", [])
                 pagination = data.get("paginationInfo", {})
                 current_page = int(pagination.get("currentPage") or page)
                 total_pages = int(pagination.get("totalPages") or 0)
                 logger.info(
                     "ProductSupplierAgreements supplierAgreementNumber=%s page %d/%d returned "
-                    "%d records in %.1fs",
+                    "%d records in %.1fs remaining_requests=%s",
                     supplier_agreement_number,
                     current_page,
                     total_pages,
                     len(items),
                     time.monotonic() - page_started_at,
+                    self._remaining_requests_label(response),
                 )
 
                 for a in items:
@@ -1195,21 +1316,23 @@ class PurchaseOrdersStream(ExtendStream):
                 params_base["changeDateFrom"],
                 params_base["changeDateTo"],
             )
-            data = self._request(
+            response = self._request(
                 f"{self.base_url}/PurchaseOrders",
                 params={**params_base, "pageNumber": page},
-            ).json()
+            )
+            data = response.json()
 
             po_list = data.get("purchaseOrderList", [])
             pagination = data.get("paginationInfo", {})
             current_page = int(pagination.get("currentPage") or page)
             total_pages = int(pagination.get("totalPages") or 0)
             logger.info(
-                "PurchaseOrders page %d/%d returned %d list records in %.1fs",
+                "PurchaseOrders page %d/%d returned %d list records in %.1fs remaining_requests=%s",
                 current_page,
                 total_pages,
                 len(po_list),
                 time.monotonic() - page_started_at,
+                self._remaining_requests_label(response),
             )
 
             if not po_list:
@@ -1410,7 +1533,8 @@ def _iter_report_days(
                     change_date_from,
                     change_date_to,
                 )
-                data = stream._request(url, params=params).json()
+                response = stream._request(url, params=params)
+                data = response.json()
             except requests.exceptions.HTTPError as exc:
                 response = exc.response
                 if response is None or response.status_code != 400 or page == 1:
@@ -1439,7 +1563,7 @@ def _iter_report_days(
             current_page = int(pagination.get("currentPage") or page)
             total_pages = int(pagination.get("totalPages") or 1)
             logger.info(
-                "Reports %s day %d/%d (%s) page %d/%d returned %d records in %.1fs",
+                "Reports %s day %d/%d (%s) page %d/%d returned %d records in %.1fs remaining_requests=%s",
                 list_key,
                 day_num,
                 total_days,
@@ -1448,6 +1572,7 @@ def _iter_report_days(
                 total_pages,
                 len(items),
                 time.monotonic() - page_started_at,
+                _remaining_requests_label(response),
             )
 
             for item in items:
