@@ -49,10 +49,10 @@ class TapExtend(Tap):
       - product_supplier_agreements   INCREMENTAL GET /ProductSupplierAgreements (child of supplier_agreements)
       - products                      INCREMENTAL GET /Products (first run unfiltered, then modifiedDateFrom/modifiedDateTo)
       - product_availability          INCREMENTAL GET /ProductAvailability (modifiedDateFrom)
-      - customer_orders               INCREMENTAL GET /CustomerOrders (modifiedDateFrom)
+      - customer_orders               INCREMENTAL after bookmark exists via GET /CustomerOrders + detail (modifiedDateFrom/modifiedDateTo)
       - purchase_orders               INCREMENTAL GET /PurchaseOrders (createDateFrom)
-      - reports_order_headers         INCREMENTAL GET /reports/{client}/OrderHeaders (changeDate day-by-day)
-      - reports_order_rows            INCREMENTAL GET /reports/{client}/OrderRows    (changeDate day-by-day)
+      - reports_order_headers         INCREMENTAL historical-only GET /reports/{client}/OrderHeaders (changeDate day-by-day)
+      - reports_order_rows            INCREMENTAL historical-only GET /reports/{client}/OrderRows    (changeDate day-by-day)
     """
 
     name = "tap-extend"
@@ -111,6 +111,7 @@ class TapExtend(Tap):
     def load_state(self, state: dict[str, Any]) -> None:
         """Normalize bookmarks and preserve report-only top-level overrides."""
         normalized_state = self._normalize_legacy_bookmarks(state)
+        self._loaded_state = normalized_state
         super().load_state(normalized_state)
 
         # hotglue_singer_sdk.Tap.load_state only copies values under

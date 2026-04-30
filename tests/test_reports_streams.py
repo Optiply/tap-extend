@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 
@@ -610,6 +611,114 @@ def test_top_level_reports_state_range_takes_precedence(monkeypatch):
         "start_date": "2026-03-01",
         "end_date": "2026-03-31",
     }]
+
+
+def test_reports_order_headers_skip_when_customer_orders_bookmark_exists(monkeypatch):
+    class Tap:
+        _loaded_state = {
+            "bookmarks": {
+                "customer_orders": {
+                    "replication_key": "changeDate",
+                    "replication_key_value": "2026-04-30T10:27:06",
+                }
+            }
+        }
+        state = {
+            "bookmarks": {
+                "customer_orders": {
+                    "replication_key": "changeDate",
+                    "replication_key_value": "2026-04-30T10:27:06",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2024-01-01T00:00:00Z",
+        }
+
+    def fail_iter(*args, **kwargs):
+        raise AssertionError("reports_order_headers should not hit the reports endpoint")
+
+    monkeypatch.setattr(stream_module, "_iter_report_days", fail_iter)
+
+    stream = stream_module.ReportsOrderHeadersStream(tap=Tap())
+    records = list(stream.get_records())
+
+    assert records == []
+
+
+def test_reports_order_rows_skip_when_customer_orders_bookmark_exists(monkeypatch):
+    class Tap:
+        _loaded_state = {
+            "bookmarks": {
+                "customer_orders": {
+                    "replication_key": "changeDate",
+                    "replication_key_value": "2026-04-30T10:27:06",
+                }
+            }
+        }
+        state = {
+            "bookmarks": {
+                "customer_orders": {
+                    "replication_key": "changeDate",
+                    "replication_key_value": "2026-04-30T10:27:06",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2024-01-01T00:00:00Z",
+        }
+
+    def fail_iter(*args, **kwargs):
+        raise AssertionError("reports_order_rows should not hit the reports endpoint")
+
+    monkeypatch.setattr(stream_module, "_iter_report_days", fail_iter)
+
+    stream = stream_module.ReportsOrderRowsStream(tap=Tap())
+    records = list(stream.get_records())
+
+    assert records == []
+
+
+def test_reports_order_headers_do_not_skip_when_customer_orders_bookmark_was_seeded_mid_run(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-20T23:59:59+00:00"
+        _loaded_state = {"bookmarks": {}}
+        state = {
+            "bookmarks": {
+                "customer_orders": {
+                    "replication_key": "changeDate",
+                    "replication_key_value": "2026-04-20T23:59:59",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2026-04-20T00:00:00Z",
+        }
+
+    calls = []
+
+    def fake_iter_report_days(stream, url, list_key, start_date, end_date):
+        calls.append((url, list_key, start_date, end_date))
+        return iter(())
+
+    monkeypatch.setattr(stream_module, "_iter_report_days", fake_iter_report_days)
+
+    stream = stream_module.ReportsOrderHeadersStream(tap=Tap())
+    records = list(stream.get_records())
+
+    assert records == []
+    assert calls == [(
+        "https://api.example.test/RESTAPI/reports/TESTCLIENT/OrderHeaders",
+        "orderHeaderList",
+        "2026-04-20",
+        "2026-04-20",
+    )]
 
 
 def test_purchase_orders_uses_change_date_datetime_range(monkeypatch):
@@ -1231,3 +1340,144 @@ def test_products_subsequent_run_uses_bookmark_window(monkeypatch):
     }]
     assert stream.stream_state["replication_key"] == "modifiedDate"
     assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"
+
+
+def test_customer_orders_first_run_skips_endpoint_and_seeds_bookmark(monkeypatch):
+    class Tap:
+        state = {"bookmarks": {"customer_orders": {}}}
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2026-04-20T00:00:00Z",
+        }
+        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
+
+    stream = stream_module.CustomerOrdersStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("CustomerOrders endpoint should not be called on first run")))
+
+    records = list(stream.get_records())
+    stream.finalize_state_progress_markers()
+
+    assert records == []
+    assert stream.stream_state["replication_key"] == "changeDate"
+    assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"
+
+
+def test_customer_orders_incremental_uses_customer_orders_and_detail(monkeypatch):
+    class Tap:
+        state = {
+            "bookmarks": {
+                "customer_orders": {
+                    "replication_key": "changeDate",
+                    "replication_key_value": "2026-04-20T10:00:00Z",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+        }
+        _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
+
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+        if url.endswith("/CustomerOrders"):
+            return FakeResponse([{
+                "orderNumber": "SO-2",
+                "orderNumberExternal": "EXT-2",
+                "orderType": "Normal",
+                "orderStatus": "Reserved",
+                "orderDate": "2026-04-22T12:00:00+00:00",
+                "askedDeliveryDate": "2026-04-23T00:00:00+00:00",
+                "slaDate": None,
+                "customerNumber": "456",
+                "customerName": "Customer Example",
+                "totalPrice": 44.0,
+                "changeDate": "2026-04-22T12:01:00+00:00",
+            }])
+        if url.endswith("/CustomerOrders/SO-2"):
+            return FakeResponse({
+                "orderHeader": {"orderNumber": "SO-2"},
+                "orderRows": [{
+                    "orderRowId": "row-2",
+                    "position": 20,
+                    "subPosition": 0,
+                    "supplyMode": "Warehouse",
+                    "warehouse": "MAIN",
+                    "orderRowStatus": "Reserved",
+                    "shipmentNumber": "SHIP-1",
+                    "expectedDeliveryDate": "2026-04-23T00:00:00+00:00",
+                    "shipDate": "2026-04-22T15:00:00+00:00",
+                    "allocationStatus": "Physical",
+                    "changeDate": "2026-04-22T12:02:00+00:00",
+                    "product": {"productNumber": "SKU-2", "productName": "Product Two"},
+                    "salesData": {
+                        "quantity": 4,
+                        "unit": "ST",
+                        "unitPrice": 11.0,
+                        "vatPercent": 25.0,
+                        "currency": "EUR",
+                    },
+                }],
+            })
+        raise AssertionError(f"Unexpected URL {url}")
+
+    stream = stream_module.CustomerOrdersStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+    monkeypatch.setattr(stream_module, "_iter_report_days", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Reports should not be used when customer_orders bookmark exists")))
+
+    records = list(stream.get_records())
+
+    assert captured == [
+        {
+            "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/CustomerOrders",
+            "params": {
+                "pageCount": 100,
+                "pageOffset": 0,
+                "modifiedDateFrom": "2026-04-20T10:00:00Z",
+                "modifiedDateTo": "2026-04-22T14:00:00",
+            },
+        },
+        {
+            "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/CustomerOrders/SO-2",
+            "params": {},
+        },
+    ]
+    assert records == [{
+        "orderNumber": "SO-2",
+        "orderNumberExternal": "EXT-2",
+        "orderType": "Normal",
+        "orderStatus": "Reserved",
+        "orderDate": "2026-04-22T12:00:00+00:00",
+        "askedDeliveryDate": "2026-04-23T00:00:00+00:00",
+        "slaDate": None,
+        "customerNumber": "456",
+        "customerName": "Customer Example",
+        "totalPrice": 44.0,
+        "changeDate": "2026-04-22T12:01:00+00:00",
+        "order_rows": json.dumps([{
+            "orderRowId": "row-2",
+            "position": 20,
+            "subPosition": 0,
+            "supplyMode": "Warehouse",
+            "productNumber": "SKU-2",
+            "productName": "Product Two",
+            "orderQuantity": 4,
+            "price": 11.0,
+            "vatPercent": 25.0,
+            "currencyId": "EUR",
+            "expectedDeliveryDate": "2026-04-23T00:00:00+00:00",
+            "shipDate": "2026-04-22T15:00:00+00:00",
+            "orderRowStatus": "Reserved",
+            "shipmentNumber": "SHIP-1",
+            "warehouseShortName": "MAIN",
+            "orderNumber": "SO-2",
+            "salesUnit": "ST",
+            "salesUnitQuantity": 4,
+            "productSalesUnitPrice": 11.0,
+            "allocationStatus": "Physical",
+            "changeDate": "2026-04-22T12:02:00+00:00",
+        }]),
+    }]

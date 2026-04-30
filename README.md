@@ -21,7 +21,7 @@ Developed and maintained by [Optiply](mailto:dev@optiply.com) · License: Apache
 | `ProductSupplierAgreementsStream` | `GET /ProductSupplierAgreements` | INCREMENTAL child of `SupplierAgreementsStream` (first run unfiltered, later runs use `supplierAgreementNumber`, `changeDateFrom`, `changeDateTo`) |
 | `ProductsStream` | `GET /Products` | INCREMENTAL (first run unfiltered, later runs use `modifiedDateFrom` + `modifiedDateTo`) |
 | `ProductAvailabilityStream` | `GET /ProductAvailability` | INCREMENTAL (`modifiedDateFrom`) |
-| `CustomerOrdersStream` | `GET /CustomerOrders` | INCREMENTAL (`modifiedDateFrom`) |
+| `CustomerOrdersStream` | `GET /CustomerOrders` | INCREMENTAL (used after `customer_orders` bookmark exists; fetches `CustomerOrders` + detail with `modifiedDateFrom` + `modifiedDateTo`) |
 | `PurchaseOrdersStream` | `GET /PurchaseOrders` | INCREMENTAL (`createDateFrom`) |
 | `ReportsOrderHeadersStream` | `GET /reports/{client}/OrderHeaders` | INCREMENTAL (day-by-day `changeDate`) |
 | `ReportsOrderRowsStream` | `GET /reports/{client}/OrderRows` | INCREMENTAL (day-by-day `changeDate`) |

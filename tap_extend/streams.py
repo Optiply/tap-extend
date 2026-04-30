@@ -6,7 +6,7 @@ Streams:
   - ProductSupplierAgreementsStream:  GET /ProductSupplierAgreements (INCREMENTAL child of supplier_agreements)
   - ProductsStream:                   GET /Products                  (INCREMENTAL, first run unfiltered then modifiedDateFrom/modifiedDateTo)
   - ProductAvailabilityStream:        GET /ProductAvailability       (INCREMENTAL, modifiedDateFrom)
-  - CustomerOrdersStream:             GET /CustomerOrders            (INCREMENTAL, modifiedDateFrom)
+  - CustomerOrdersStream:             first run via reports, then GET /CustomerOrders + detail
   - PurchaseOrdersStream:             GET /PurchaseOrders            (INCREMENTAL, createDateFrom)
   - ReportsOrderHeadersStream:        GET /reports/{client}/OrderHeaders  (INCREMENTAL, changeDate day-by-day)
   - ReportsOrderRowsStream:           GET /reports/{client}/OrderRows     (INCREMENTAL, changeDate day-by-day)
@@ -1132,11 +1132,15 @@ class ProductAvailabilityStream(ExtendStream):
 class CustomerOrdersStream(ExtendStream):
     """Extend Commerce CustomerOrders with full detail (header + rows).
 
-    List endpoint returns CustomerOrderListItem summaries.
-    Detail endpoint is called per order to get orderRows.
-    Rows serialised as JSON string for ETL processing.
+    First run (no customer_orders bookmark): defers historical extraction to
+    the reports_order_headers / reports_order_rows streams and seeds a bookmark
+    for future incremental CustomerOrders syncs.
 
-    CRITICAL: Always pass modifiedDateFrom — without it the endpoint times out.
+    Subsequent runs: uses CustomerOrders list with modifiedDateFrom/
+    modifiedDateTo plus one detail call per order to fetch order rows.
+
+    Rows are serialised as JSON strings using a report-row-compatible shape.
+
     Pagination: pageCount + pageOffset (NOT pageNumber).
     Replication key: changeDate (from CustomerOrderListItem).
 
@@ -1168,15 +1172,39 @@ class CustomerOrdersStream(ExtendStream):
         th.Property("order_rows", th.StringType),
     ).to_dict()
 
-    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
-        start_replication = self.get_starting_replication_key_value(context)
-        if start_replication:
-            modified_date_from = str(start_replication)
-        elif self.config.get("start_date"):
-            modified_date_from = str(self.config["start_date"])
+    def _has_customer_orders_bookmark(self, context: Optional[dict]) -> bool:
+        state = self.get_context_state(context)
+        return (
+            state.get("replication_key") == self.replication_key
+            and state.get("replication_key_value") not in (None, "")
+        )
+
+    def get_replication_key_signpost(self, context: Optional[dict]) -> Optional[str]:
+        """Freeze bookmark advancement to the tap-run upper bound."""
+        return self._format_extend_datetime(self.sync_upper_bound)
+
+    def finalize_state_progress_markers(self, state: Optional[dict] = None) -> None:
+        """Persist the tap-run upper bound even when CustomerOrders is skipped."""
+        if state in (None, {}):
+            for context in self.partitions or [{}]:
+                finalize_sdk_state_progress_markers(self.get_context_state(context or None))
+            target_state = self.stream_state
         else:
-            two_years_ago = datetime.now(timezone.utc) - timedelta(days=730)
-            modified_date_from = two_years_ago.strftime("%Y-%m-%dT%H:%M:%S")
+            finalize_sdk_state_progress_markers(state)
+            target_state = state
+        target_state["replication_key"] = self.replication_key
+        target_state["replication_key_value"] = self.get_replication_key_signpost(None)
+
+    def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        if not self._has_customer_orders_bookmark(context):
+            logger.info(
+                "CustomerOrders: no bookmark present; skipping endpoint sync so reports streams "
+                "can serve as the historical source. Seeding bookmark for next run."
+            )
+            return
+
+        start_replication = self.get_starting_replication_key_value(context)
+        modified_date_from = str(start_replication)
 
         page_offset = 0
         page_count = 100
@@ -1188,7 +1216,7 @@ class CustomerOrdersStream(ExtendStream):
                 "pageOffset": page_offset,
                 "modifiedDateFrom": modified_date_from,
             }
-            params["changeDateTo"] = self.sync_upper_bound
+            params["modifiedDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
 
             try:
                 order_list = self._request(
@@ -1256,10 +1284,46 @@ class CustomerOrdersStream(ExtendStream):
         try:
             detail = self._request(f"{self.base_url}/CustomerOrders/{order_number}").json()
             rows = detail.get("orderRows", [])
-            return rows if isinstance(rows, list) else []
+            if not isinstance(rows, list):
+                return []
+            return [
+                self._normalize_customer_order_row_from_detail(order_number, row)
+                for row in rows
+            ]
         except Exception:
             logger.warning("Failed to fetch rows for order %s", order_number, exc_info=True)
             return []
+
+    @staticmethod
+    def _normalize_customer_order_row_from_detail(
+        order_number: str,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        product = row.get("product") or {}
+        sales_data = row.get("salesData") or {}
+        return {
+            "orderRowId": row.get("orderRowId"),
+            "position": row.get("position"),
+            "subPosition": row.get("subPosition"),
+            "supplyMode": row.get("supplyMode"),
+            "productNumber": product.get("productNumber"),
+            "productName": product.get("productName"),
+            "orderQuantity": sales_data.get("quantity"),
+            "price": sales_data.get("unitPrice"),
+            "vatPercent": sales_data.get("vatPercent"),
+            "currencyId": sales_data.get("currency"),
+            "expectedDeliveryDate": row.get("expectedDeliveryDate"),
+            "shipDate": row.get("shipDate"),
+            "orderRowStatus": row.get("orderRowStatus"),
+            "shipmentNumber": row.get("shipmentNumber"),
+            "warehouseShortName": row.get("warehouse"),
+            "orderNumber": order_number,
+            "salesUnit": sales_data.get("unit"),
+            "salesUnitQuantity": sales_data.get("quantity"),
+            "productSalesUnitPrice": sales_data.get("unitPrice"),
+            "allocationStatus": row.get("allocationStatus"),
+            "changeDate": row.get("changeDate"),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1693,6 +1757,35 @@ def _report_state_date_range(stream: "ExtendStream") -> tuple[Optional[str], Opt
     return None, None
 
 
+def _stream_has_bookmark(
+    stream: "ExtendStream",
+    stream_name: str,
+    replication_key: Optional[str] = None,
+) -> bool:
+    """Return True when the given stream has a persisted replication bookmark."""
+    tap = getattr(stream, "_tap", None)
+    tap_state = getattr(tap, "_loaded_state", None)
+    if tap_state is None:
+        tap_state = getattr(stream, "tap_state", None)
+    if tap_state is None:
+        tap_state = getattr(tap, "state", {}) or {}
+    if not isinstance(tap_state, dict):
+        return False
+
+    bookmarks = tap_state.get("bookmarks", {})
+    if not isinstance(bookmarks, dict):
+        return False
+
+    stream_state = bookmarks.get(stream_name)
+    if not isinstance(stream_state, dict):
+        return False
+
+    if replication_key and stream_state.get("replication_key") != replication_key:
+        return False
+
+    return stream_state.get("replication_key_value") not in (None, "")
+
+
 # ---------------------------------------------------------------------------
 # ReportsOrderHeadersStream  —  GET /reports/{client}/OrderHeaders
 # ---------------------------------------------------------------------------
@@ -1786,6 +1879,10 @@ class ReportsOrderHeadersStream(ExtendStream):
     window (00:00:00 through 23:59:59) and paginating all pages within each day
     before advancing.
 
+    Historical source only for sell orders. Once customer_orders has its own
+    bookmark, this stream stops emitting so incremental sell-order extraction
+    comes exclusively from CustomerOrders + CustomerOrders/{orderNumber}.
+
     Pagination: pageNumber (1-based), stop when currentPage == totalPages.
     Replication key: changeDate.
     """
@@ -1808,6 +1905,13 @@ class ReportsOrderHeadersStream(ExtendStream):
         return f"{api_url}/reports/{self.config['client']}/OrderHeaders"
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        if _stream_has_bookmark(self, "customer_orders", replication_key="changeDate"):
+            logger.info(
+                "Skipping reports_order_headers because customer_orders bookmark exists; "
+                "CustomerOrders is now the active sell-order incremental source."
+            )
+            return
+
         reports_start_date, reports_end_date = _report_state_date_range(self)
         start_replication = self.get_starting_replication_key_value(context)
         if reports_start_date:
@@ -1911,6 +2015,10 @@ class ReportsOrderRowsStream(ExtendStream):
     window (00:00:00 through 23:59:59) and paginating all pages within each day
     before advancing.
 
+    Historical source only for sell orders. Once customer_orders has its own
+    bookmark, this stream stops emitting so incremental sell-order extraction
+    comes exclusively from CustomerOrders + CustomerOrders/{orderNumber}.
+
     Pagination: pageNumber (1-based), stop when currentPage == totalPages.
     Replication key: changeDate.
     """
@@ -1933,6 +2041,13 @@ class ReportsOrderRowsStream(ExtendStream):
         return f"{api_url}/reports/{self.config['client']}/OrderRows"
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
+        if _stream_has_bookmark(self, "customer_orders", replication_key="changeDate"):
+            logger.info(
+                "Skipping reports_order_rows because customer_orders bookmark exists; "
+                "CustomerOrders is now the active sell-order incremental source."
+            )
+            return
+
         reports_start_date, reports_end_date = _report_state_date_range(self)
         start_replication = self.get_starting_replication_key_value(context)
         if reports_start_date:
