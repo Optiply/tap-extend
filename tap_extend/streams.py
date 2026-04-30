@@ -434,8 +434,7 @@ class ExtendStream(Stream):
     def _write_state_message(self) -> None:
         """Emit state without transient signpost/progress marker noise."""
         try:
-            tap = getattr(self, "_tap", None)
-            live_state = getattr(tap, "state", None)
+            live_state = self.tap_state
             if not isinstance(live_state, dict):
                 super()._write_state_message()
                 return
@@ -454,12 +453,12 @@ class ExtendStream(Stream):
                     else:
                         stream_state.pop("partitions", None)
 
-            original_state = tap.state
-            tap.state = sanitized_state
+            original_state = self._tap_state
+            self._tap_state = sanitized_state
             try:
                 super()._write_state_message()
             finally:
-                tap.state = original_state
+                self._tap_state = original_state
         except Exception as exc:
             self.logger.warning("Error writing state message: %s", exc)
 
@@ -1221,8 +1220,16 @@ class CustomerOrdersStream(ExtendStream):
         else:
             finalize_sdk_state_progress_markers(state)
             target_state = state
+        self._advance_bookmark_to_signpost(target_state)
+
+    def _advance_bookmark_to_signpost(self, state: Optional[dict] = None) -> None:
+        """Set CustomerOrders bookmark to the stable tap-run upper bound."""
+        target_state = state if state is not None else self.stream_state
         target_state["replication_key"] = self.replication_key
         target_state["replication_key_value"] = self.get_replication_key_signpost(None)
+        target_state.pop("replication_key_signpost", None)
+        target_state.pop("starting_replication_value", None)
+        target_state.pop("progress_markers", None)
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
         if not self._has_customer_orders_bookmark(context):
@@ -1230,10 +1237,11 @@ class CustomerOrdersStream(ExtendStream):
                 "CustomerOrders: no bookmark present; skipping endpoint sync so reports streams "
                 "can serve as the historical source. Seeding bookmark for next run."
             )
+            self._advance_bookmark_to_signpost(self.get_context_state(context))
             return
 
         start_replication = self.get_starting_replication_key_value(context)
-        modified_date_from = str(start_replication)
+        modified_date_from = self._format_extend_datetime(start_replication)
 
         page_offset = 0
         page_count = 100
@@ -1247,6 +1255,12 @@ class CustomerOrdersStream(ExtendStream):
             }
             params["modifiedDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
 
+            logger.info(
+                "Requesting CustomerOrders pageOffset=%d modifiedDateFrom=%s modifiedDateTo=%s",
+                page_offset,
+                params["modifiedDateFrom"],
+                params["modifiedDateTo"],
+            )
             try:
                 order_list = self._request(
                     f"{self.base_url}/CustomerOrders",
@@ -1299,6 +1313,7 @@ class CustomerOrdersStream(ExtendStream):
                 )
 
         logger.info("CustomerOrders: done — %d orders", total_orders)
+        self._advance_bookmark_to_signpost(self.get_context_state(context))
 
     def _fetch_order_rows(self, order_number: str) -> list:
         """Fetch orderRows from GET /CustomerOrders/{id}.

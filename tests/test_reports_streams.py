@@ -1476,7 +1476,7 @@ def test_customer_orders_incremental_uses_customer_orders_and_detail(monkeypatch
             "params": {
                 "pageCount": 100,
                 "pageOffset": 0,
-                "modifiedDateFrom": "2026-04-20T10:00:00Z",
+                "modifiedDateFrom": "2026-04-20T10:00:00",
                 "modifiedDateTo": "2026-04-22T14:00:00",
             },
         },
