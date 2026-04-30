@@ -721,6 +721,46 @@ def test_reports_order_headers_do_not_skip_when_customer_orders_bookmark_was_see
     )]
 
 
+def test_sanitize_signpost_bookmark_state_prefers_signpost_and_drops_noise():
+    cleaned = stream_module._sanitize_signpost_bookmark_state(
+        {
+            "replication_key": "changeDate",
+            "replication_key_value": "2026-04-30T08:31:57",
+            "replication_key_signpost": "2026-04-30T10:31:26",
+            "starting_replication_value": "2026-04-30T08:31:57",
+            "progress_markers": {
+                "replication_key": "changeDate",
+                "replication_key_value": "2026-04-30 11:42:43",
+            },
+            "partitions": {"foo": "bar"},
+        },
+        "changeDate",
+    )
+
+    assert cleaned == {
+        "replication_key": "changeDate",
+        "replication_key_value": "2026-04-30T10:31:26",
+    }
+
+
+def test_sanitize_signpost_bookmark_state_uses_progress_marker_when_no_signpost():
+    cleaned = stream_module._sanitize_signpost_bookmark_state(
+        {
+            "progress_markers": {
+                "replication_key": "modifiedDate",
+                "replication_key_value": "2026-04-30T10:31:26",
+            },
+            "starting_replication_value": "2026-04-30T09:00:00",
+        },
+        "modifiedDate",
+    )
+
+    assert cleaned == {
+        "replication_key": "modifiedDate",
+        "replication_key_value": "2026-04-30T10:31:26",
+    }
+
+
 def test_purchase_orders_uses_change_date_datetime_range(monkeypatch):
     class Tap:
         _extend_sync_upper_bound = "2026-04-20T17:18:46+00:00"

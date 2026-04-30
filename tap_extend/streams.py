@@ -23,6 +23,7 @@ Pagination:
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import logging
 from email.utils import parsedate_to_datetime
@@ -53,6 +54,12 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+_SIGNPOST_BOOKMARK_STREAMS = {
+    "product_supplier_agreements": "changeDate",
+    "products": "modifiedDate",
+    "customer_orders": "changeDate",
+}
 
 REQUESTS_PER_SECOND = 4.0
 MIN_REQUESTS_PER_SECOND = 0.1
@@ -425,12 +432,34 @@ class ExtendStream(Stream):
         return response
 
     def _write_state_message(self) -> None:
-        """Clean partitions from state to avoid bloat."""
+        """Emit state without transient signpost/progress marker noise."""
         try:
-            tap_state = getattr(getattr(self, "_tap", None), "state", {}) or {}
-            for stream_state in tap_state.get("bookmarks", {}).values():
-                stream_state.pop("partitions", None)
-            super()._write_state_message()
+            tap = getattr(self, "_tap", None)
+            live_state = getattr(tap, "state", None)
+            if not isinstance(live_state, dict):
+                super()._write_state_message()
+                return
+
+            sanitized_state = copy.deepcopy(live_state)
+            bookmarks = sanitized_state.get("bookmarks", {})
+            if isinstance(bookmarks, dict):
+                for stream_name, stream_state in list(bookmarks.items()):
+                    if not isinstance(stream_state, dict):
+                        continue
+                    if stream_name in _SIGNPOST_BOOKMARK_STREAMS:
+                        bookmarks[stream_name] = _sanitize_signpost_bookmark_state(
+                            stream_state,
+                            _SIGNPOST_BOOKMARK_STREAMS[stream_name],
+                        )
+                    else:
+                        stream_state.pop("partitions", None)
+
+            original_state = tap.state
+            tap.state = sanitized_state
+            try:
+                super()._write_state_message()
+            finally:
+                tap.state = original_state
         except Exception as exc:
             self.logger.warning("Error writing state message: %s", exc)
 
@@ -1784,6 +1813,33 @@ def _stream_has_bookmark(
         return False
 
     return stream_state.get("replication_key_value") not in (None, "")
+
+
+def _sanitize_signpost_bookmark_state(
+    stream_state: dict[str, Any],
+    replication_key: str,
+) -> dict[str, Any]:
+    """Return a clean persisted bookmark for signpost-based streams."""
+    normalized = dict(stream_state)
+
+    bookmark_value = normalized.get("replication_key_value")
+    progress_markers = normalized.get("progress_markers")
+    if normalized.get("replication_key_signpost") not in (None, ""):
+        bookmark_value = normalized.get("replication_key_signpost")
+    elif isinstance(progress_markers, dict) and progress_markers.get("replication_key") == replication_key:
+        progress_value = progress_markers.get("replication_key_value")
+        if progress_value not in (None, ""):
+            bookmark_value = progress_value
+
+    if bookmark_value not in (None, ""):
+        normalized["replication_key"] = replication_key
+        normalized["replication_key_value"] = bookmark_value
+
+    normalized.pop("replication_key_signpost", None)
+    normalized.pop("starting_replication_value", None)
+    normalized.pop("progress_markers", None)
+    normalized.pop("partitions", None)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
