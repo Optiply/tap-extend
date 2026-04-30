@@ -734,6 +734,49 @@ class ProductSupplierAgreementsStream(ExtendStream):
             target_state = state
         target_state["replication_key"] = self.replication_key
         target_state["replication_key_value"] = self.get_replication_key_signpost(None)
+        target_state.pop("replication_key_signpost", None)
+        target_state.pop("starting_replication_value", None)
+        target_state.pop("progress_markers", None)
+
+    def _get_start_replication_value(self, state: dict[str, Any]) -> Optional[str]:
+        """Return the best usable ProductSupplierAgreements bookmark.
+
+        Older completed jobs can persist SDK progress-marker state without promoting it
+        to the top-level replication_key/replication_key_value pair. Prefer the
+        completed-run signpost in that shape so the next run remains incremental.
+        """
+        if state.get("replication_key") == self.replication_key:
+            value = state.get("replication_key_value")
+            return str(value) if value not in (None, "") else None
+
+        signpost = state.get("replication_key_signpost")
+        if signpost not in (None, ""):
+            current_run_signpost = self.get_replication_key_signpost(None)
+            if str(signpost) == current_run_signpost:
+                return None
+            logger.warning(
+                "Using ProductSupplierAgreements replication_key_signpost=%s as legacy bookmark; "
+                "state was not finalized to replication_key_value.",
+                signpost,
+            )
+            return str(signpost)
+
+        progress_markers = state.get("progress_markers")
+        if (
+            isinstance(progress_markers, dict)
+            and progress_markers.get("replication_key") == self.replication_key
+        ):
+            value = progress_markers.get("replication_key_value")
+            if value not in (None, ""):
+                logger.warning(
+                    "Using ProductSupplierAgreements progress marker %s=%s as legacy bookmark; "
+                    "state was not finalized.",
+                    self.replication_key,
+                    value,
+                )
+                return str(value)
+
+        return None
 
     def _increment_stream_state(
         self, latest_record: dict[str, Any], *, context: Optional[dict] = None
@@ -761,9 +804,7 @@ class ProductSupplierAgreementsStream(ExtendStream):
         url = f"{self.base_url}/ProductSupplierAgreements"
         total_emitted = 0
         current_state = self.get_context_state(context)
-        start_replication = None
-        if current_state.get("replication_key") == self.replication_key:
-            start_replication = current_state.get("replication_key_value")
+        start_replication = self._get_start_replication_value(current_state)
         params_base: dict[str, Any] = {
             "supplierAgreementNumber": supplier_agreement_number,
         }

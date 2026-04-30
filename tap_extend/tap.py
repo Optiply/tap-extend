@@ -135,6 +135,10 @@ class TapExtend(Tap):
 
         for stream_name, stream_state in bookmarks.items():
             if isinstance(stream_state, dict):
+                if stream_name == "product_supplier_agreements":
+                    stream_state = self._normalize_product_supplier_agreements_bookmark(
+                        stream_state
+                    )
                 normalized_bookmarks[stream_name] = stream_state
                 continue
 
@@ -161,6 +165,40 @@ class TapExtend(Tap):
 
         normalized_state["bookmarks"] = normalized_bookmarks
         return normalized_state
+
+    def _normalize_product_supplier_agreements_bookmark(
+        self,
+        stream_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Promote legacy PSA progress-marker state to a normal Singer bookmark."""
+        if stream_state.get("replication_key") == "changeDate" and stream_state.get(
+            "replication_key_value"
+        ) not in (None, ""):
+            return stream_state
+
+        bookmark_value = stream_state.get("replication_key_signpost")
+        source = "replication_key_signpost"
+        progress_markers = stream_state.get("progress_markers")
+        if bookmark_value in (None, "") and isinstance(progress_markers, dict):
+            if progress_markers.get("replication_key") == "changeDate":
+                bookmark_value = progress_markers.get("replication_key_value")
+                source = "progress_markers.replication_key_value"
+
+        if bookmark_value in (None, ""):
+            return stream_state
+
+        self.logger.warning(
+            "Normalizing product_supplier_agreements bookmark from %s=%s.",
+            source,
+            bookmark_value,
+        )
+        normalized = dict(stream_state)
+        normalized["replication_key"] = "changeDate"
+        normalized["replication_key_value"] = bookmark_value
+        normalized.pop("replication_key_signpost", None)
+        normalized.pop("starting_replication_value", None)
+        normalized.pop("progress_markers", None)
+        return normalized
 
     def discover_streams(self) -> List:
         """Return stream instances."""

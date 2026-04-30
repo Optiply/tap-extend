@@ -936,6 +936,109 @@ def test_product_supplier_agreements_uses_bookmark_and_persists_run_upper_bound(
     assert stream.stream_state["replication_key_value"] == "2026-04-22T14:00:00"
 
 
+def test_product_supplier_agreements_uses_legacy_signpost_bookmark(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-30T08:31:57+00:00"
+        state = {
+            "bookmarks": {
+                "product_supplier_agreements": {
+                    "replication_key_signpost": "2026-04-30T06:31:48",
+                    "starting_replication_value": "2010-01-01T00:00:00.000Z",
+                    "progress_markers": {
+                        "Note": "Progress is not resumable if interrupted.",
+                        "replication_key": "changeDate",
+                        "replication_key_value": "2026-04-30 08:20:35",
+                    },
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+        }
+
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return {
+                    "productSupplierAgreementList": [],
+                    "paginationInfo": {"currentPage": 1, "totalPages": 1},
+                }
+
+        return Response()
+
+    stream = stream_module.ProductSupplierAgreementsStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records({"supplierAgreementNumber": 303}))
+    stream.finalize_state_progress_markers()
+
+    assert records == []
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/ProductSupplierAgreements",
+        "params": {
+            "supplierAgreementNumber": 303,
+            "changeDateFrom": "2026-04-30T06:31:48",
+            "changeDateTo": "2026-04-30T08:31:57",
+            "pageNumber": 1,
+        },
+    }]
+    assert stream.stream_state == {
+        "replication_key": "changeDate",
+        "replication_key_value": "2026-04-30T08:31:57",
+    }
+
+
+def test_product_supplier_agreements_ignores_current_run_signpost_on_first_sync(monkeypatch):
+    class Tap:
+        _extend_sync_upper_bound = "2026-04-30T08:56:43+00:00"
+        state = {
+            "bookmarks": {
+                "product_supplier_agreements": {
+                    "replication_key_signpost": "2026-04-30T08:56:43",
+                    "starting_replication_value": "2010-01-01T00:00:00.000Z",
+                }
+            }
+        }
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+            "start_date": "2010-01-01T00:00:00Z",
+        }
+
+    captured = []
+
+    def fake_request(url, params=None):
+        captured.append({"url": url, "params": dict(params or {})})
+
+        class Response:
+            def json(self):
+                return {
+                    "productSupplierAgreementList": [],
+                    "paginationInfo": {"currentPage": 1, "totalPages": 1},
+                }
+
+        return Response()
+
+    stream = stream_module.ProductSupplierAgreementsStream(tap=Tap())
+    monkeypatch.setattr(stream, "_request", fake_request)
+
+    records = list(stream.get_records({"supplierAgreementNumber": 404}))
+
+    assert records == []
+    assert captured == [{
+        "url": "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/ProductSupplierAgreements",
+        "params": {
+            "supplierAgreementNumber": 404,
+            "pageNumber": 1,
+        },
+    }]
+
+
 def test_product_supplier_agreements_first_run_ignores_start_date_until_bookmark_exists(monkeypatch):
     class Tap:
         _extend_sync_upper_bound = "2026-04-22T14:00:00+00:00"
