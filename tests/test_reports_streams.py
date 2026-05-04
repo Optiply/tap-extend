@@ -74,6 +74,7 @@ def reset_rate_limit_state():
     stream_module.ExtendStream._next_request_at = 0.0
     stream_module.ExtendStream._rate_limit_next_request_at = {}
     stream_module.ExtendStream._rate_limit_requests_per_second = {}
+    stream_module.ExtendStream._rate_limit_ignored_higher_logged = set()
 
 
 class FakeResponse:
@@ -162,6 +163,26 @@ def test_request_learns_report_rate_limit_from_headers(monkeypatch):
 
     assert stream_module.ExtendStream._rate_limit_requests_per_second["reports:TESTCLIENT"] == 1.0
     assert clock["sleeps"] == [1.0]
+
+
+def test_request_keeps_conservative_rate_when_later_headers_are_higher(monkeypatch):
+    class Tap:
+        config = {"request_timeout_seconds": 10}
+
+    clock = install_fake_clock(monkeypatch)
+    url = "https://api.example.test/RESTAPI/v1_0/TESTCLIENT/CustomerOrders"
+    stream = stream_module.ExtendStream(tap=Tap())
+    stream._session = FakeSession([
+        FakeHTTPResponse(200, "{}", {"x-ratelimit-limit": "300", "x-ratelimit-remaining": "299"}, url),
+        FakeHTTPResponse(200, "{}", {"x-ratelimit-limit": "3000", "x-ratelimit-remaining": "2999"}, url),
+    ])
+
+    stream._request(url)
+    stream._request(url)
+
+    bucket = "v1_0:TESTCLIENT:CustomerOrders"
+    assert stream_module.ExtendStream._rate_limit_requests_per_second[bucket] == 5.0
+    assert clock["sleeps"] == [0.2]
 
 
 def test_request_caps_unusually_high_rate_limit_headers(monkeypatch):
@@ -1477,7 +1498,6 @@ def test_customer_orders_incremental_uses_customer_orders_and_detail(monkeypatch
                 "pageCount": 100,
                 "pageOffset": 0,
                 "modifiedDateFrom": "2026-04-20T10:00:00",
-                "modifiedDateTo": "2026-04-22T14:00:00",
             },
         },
         {

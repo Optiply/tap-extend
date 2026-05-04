@@ -91,6 +91,7 @@ class ExtendStream(Stream):
     _next_request_at = 0.0  # Backwards-compatible fallback for tests/older call sites.
     _rate_limit_next_request_at: dict[str, float] = {}
     _rate_limit_requests_per_second: dict[str, float] = {}
+    _rate_limit_ignored_higher_logged: set[str] = set()
 
     @property
     def session(self) -> requests.Session:
@@ -270,6 +271,19 @@ class ExtendStream(Stream):
                     self.requests_per_second,
                 )
                 previous_rate = ExtendStream._rate_limit_requests_per_second.get(bucket)
+                if previous_rate is not None and effective_rate > previous_rate:
+                    if bucket not in ExtendStream._rate_limit_ignored_higher_logged:
+                        logger.info(
+                            "Rate limit bucket %s keeping %.3f requests/sec; ignoring higher "
+                            "x-ratelimit-limit=%s (%.3f requests/sec).",
+                            bucket,
+                            previous_rate,
+                            limit_value,
+                            effective_rate,
+                        )
+                        ExtendStream._rate_limit_ignored_higher_logged.add(bucket)
+                    effective_rate = previous_rate
+
                 ExtendStream._rate_limit_requests_per_second[bucket] = effective_rate
                 ExtendStream._rate_limit_next_request_at[bucket] = max(
                     ExtendStream._rate_limit_next_request_at.get(bucket, 0.0),
@@ -277,9 +291,11 @@ class ExtendStream(Stream):
                 )
                 if previous_rate != effective_rate:
                     logger.info(
-                        "Rate limit bucket %s using %.3f requests/sec from x-ratelimit-limit=%s",
+                        "Rate limit bucket %s using %.3f requests/sec from x-ratelimit-limit=%s "
+                        "(%s requests/min).",
                         bucket,
                         effective_rate,
+                        limit_value,
                         limit_value,
                     )
 
@@ -1253,13 +1269,11 @@ class CustomerOrdersStream(ExtendStream):
                 "pageOffset": page_offset,
                 "modifiedDateFrom": modified_date_from,
             }
-            params["modifiedDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
 
             logger.info(
-                "Requesting CustomerOrders pageOffset=%d modifiedDateFrom=%s modifiedDateTo=%s",
+                "Requesting CustomerOrders pageOffset=%d modifiedDateFrom=%s",
                 page_offset,
                 params["modifiedDateFrom"],
-                params["modifiedDateTo"],
             )
             try:
                 order_list = self._request(
@@ -1282,10 +1296,30 @@ class CustomerOrdersStream(ExtendStream):
 
             total_orders += len(order_list)
 
-            for o in order_list:
+            page_size = len(order_list)
+            page_detail_started_at = time.monotonic()
+            customer_orders_bucket = self._rate_limit_bucket(f"{self.base_url}/CustomerOrders")
+            for index, o in enumerate(order_list, start=1):
                 order_number = str(o.get("orderNumber") or "")
                 if not order_number:
                     continue
+
+                if index == 1 or index % 10 == 0 or index == page_size:
+                    elapsed_seconds = max(time.monotonic() - page_detail_started_at, 0.001)
+                    started_per_second = index / elapsed_seconds
+                    logger.info(
+                        "CustomerOrders pageOffset=%d fetching order details %d/%d "
+                        "(total listed=%d) orderNumber=%s avg_start_rate=%.2f/s "
+                        "throttle_limit=%.2f/s bucket=%s",
+                        page_offset,
+                        index,
+                        page_size,
+                        total_orders,
+                        order_number,
+                        started_per_second,
+                        self._bucket_requests_per_second(customer_orders_bucket),
+                        customer_orders_bucket,
+                    )
 
                 yield {
                     "orderNumber": order_number,
