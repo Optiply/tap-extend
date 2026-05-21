@@ -963,6 +963,12 @@ class ProductsStream(ExtendStream):
         th.Property("statisticalCategory3", th.StringType),
         th.Property("companyGroup", th.StringType),
         th.Property("financialCategory", th.StringType),
+        # Product detail fields from GET /Products/{productNumber}.
+        th.Property("annulled", th.BooleanType),
+        th.Property("productHandlings", th.StringType),
+        th.Property("assortmentCategory", th.StringType),
+        th.Property("productVisibility", th.StringType),
+        th.Property("detailChangedDate", th.DateTimeType),
         th.Property("modifiedDate", th.DateTimeType),
         # Aggregated per-warehouse stock as JSON: [{warehouse, availableBalance}]
         th.Property("warehouse_stock", th.StringType),
@@ -989,6 +995,51 @@ class ProductsStream(ExtendStream):
     ) -> None:
         """Products bookmarks are signpost-based, not row-derived."""
         return
+
+
+    def _get_product_detail_fields(self, product_number: str) -> dict[str, Any]:
+        """Fetch and flatten product-detail fields needed for visibility/status rules."""
+        try:
+            detail = self._request(f"{self.base_url}/Products/{product_number}").json()
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            logger.warning(
+                "Products: detail lookup failed for productNumber=%s status=%s; emitting list fields only",
+                product_number,
+                status_code,
+            )
+            return {}
+
+        if not isinstance(detail, dict):
+            return {}
+
+        product_data = detail.get("productData") or {}
+        if not isinstance(product_data, dict):
+            product_data = {}
+
+        product_services = product_data.get("productServices") or {}
+        if not isinstance(product_services, dict):
+            product_services = {}
+
+        groups = product_data.get("productGroupsAndCategories") or {}
+        if not isinstance(groups, dict):
+            groups = {}
+
+        product_dates = product_data.get("productDates") or {}
+        if not isinstance(product_dates, dict):
+            product_dates = {}
+
+        product_handlings = product_services.get("productHandlings")
+        if product_handlings is not None and not isinstance(product_handlings, str):
+            product_handlings = json.dumps(product_handlings)
+
+        return {
+            "annulled": product_data.get("annulled"),
+            "productHandlings": product_handlings,
+            "assortmentCategory": groups.get("assortmentCategory"),
+            "productVisibility": product_data.get("productVisibility"),
+            "detailChangedDate": product_dates.get("changedDate"),
+        }
 
     def get_records(self, context: Optional[dict] = None) -> Iterable[dict]:
         seen: dict[str, dict] = {}
@@ -1041,7 +1092,7 @@ class ProductsStream(ExtendStream):
 
                 if pn not in seen:
                     groups = p.get("productGroupsAndCategories") or {}
-                    seen[pn] = {
+                    record = {
                         "productNumber": pn,
                         "productName": p.get("productName"),
                         "createDate": p.get("createDate"),
@@ -1061,6 +1112,8 @@ class ProductsStream(ExtendStream):
                         "financialCategory": groups.get("financialCategory"),
                         "modifiedDate": p.get("modifiedDate"),
                     }
+                    record.update(self._get_product_detail_fields(pn))
+                    seen[pn] = record
 
             if len(product_list) < page_count:
                 break
