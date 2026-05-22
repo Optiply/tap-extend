@@ -1482,6 +1482,21 @@ class PurchaseOrdersStream(ExtendStream):
     replication_key = "changeDate"
     replication_method = "INCREMENTAL"
 
+    def get_change_date_to_for_query(self) -> str:
+        """Return PurchaseOrders changeDateTo query upper bound.
+
+        Extend reported that PurchaseOrders change-date filtering currently
+        ignores the time of day. Until Extend fixes that behavior, query
+        through the current tap-run timestamp plus one day so same-day changes
+        are included.
+        """
+        use_tomorrow = self.config.get("purchase_orders_change_date_to_tomorrow", True)
+        if not use_tomorrow:
+            return self._format_extend_datetime(self.sync_upper_bound)
+
+        query_upper_bound = datetime.fromisoformat(self.sync_upper_bound) + timedelta(days=1)
+        return self._format_extend_datetime(query_upper_bound)
+
     schema = th.PropertiesList(
         # PurchaseOrderListItem fields
         th.Property("purchaseNumber", th.StringType),
@@ -1539,7 +1554,7 @@ class PurchaseOrdersStream(ExtendStream):
             params_base["changeDateFrom"] = self._format_extend_datetime(self.config["start_date"])
         else:
             params_base["changeDateFrom"] = self._format_extend_datetime(self.sync_upper_bound)
-        params_base["changeDateTo"] = self._format_extend_datetime(self.sync_upper_bound)
+        params_base["changeDateTo"] = self.get_change_date_to_for_query()
 
         page = 1
         total_emitted = 0
