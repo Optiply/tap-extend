@@ -820,6 +820,39 @@ def test_purchase_orders_uses_change_date_datetime_range(monkeypatch):
     }]
 
 
+def test_purchase_orders_strips_timezone_offsets_from_problem_datetimes():
+    class Tap:
+        config = {
+            "api_url": "https://api.example.test/RESTAPI",
+            "client": "TESTCLIENT",
+        }
+
+    stream = stream_module.PurchaseOrdersStream(tap=Tap())
+    record = stream._map_detail(
+        {
+            "header": {
+                "purchaseNumber": "RP-11423",
+                "createDate": "2026-06-29T16:13:19.11+02:00",
+                "changeDate": "2026-07-03T05:31:25+02:00",
+            },
+            "rows": [
+                {
+                    "expectedDeliveryDate": "2026-07-03T00:00:00+02:00",
+                    "statusChangeDate": "2026-07-02T09:42:04+02:00",
+                }
+            ],
+            "shipments": [],
+        },
+        {},
+    )
+
+    rows = json.loads(record["rows"])
+    assert record["createDate"] == "2026-06-29T16:13:19.11"
+    assert record["changeDate"] == "2026-07-03T05:31:25"
+    assert rows[0]["expectedDeliveryDate"] == "2026-07-03T00:00:00"
+    assert rows[0]["statusChangeDate"] == "2026-07-02T09:42:04"
+
+
 def test_purchase_orders_missing_detail_400_falls_back_to_summary(monkeypatch):
     class Tap:
         _extend_sync_upper_bound = "2026-04-22T11:20:00+00:00"

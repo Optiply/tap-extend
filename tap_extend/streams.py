@@ -79,6 +79,26 @@ def _remaining_requests_label(response: requests.Response) -> str:
     return headers.get("x-ratelimit-remaining", "unknown")
 
 
+def _strip_timezone_offset(value: Any) -> Any:
+    """Strip trailing timezone offsets while preserving local datetime text."""
+    if not isinstance(value, str) or not value:
+        return value
+
+    text = value.strip()
+    if text.endswith("Z") and "T" in text:
+        return text[:-1]
+
+    for sign in ("+", "-"):
+        marker_index = text.rfind(sign)
+        if marker_index <= len("YYYY-MM-DDT"):
+            continue
+        suffix = text[marker_index:]
+        if len(suffix) == 6 and suffix[3] == ":" and suffix[1:3].isdigit() and suffix[4:6].isdigit():
+            return text[:marker_index]
+
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Shared base class
 # ---------------------------------------------------------------------------
@@ -1644,17 +1664,23 @@ class PurchaseOrdersStream(ExtendStream):
         delivery_addr = header.get("deliveryAddress", {}) or {}
         buyer = header.get("buyerContact", {}) or {}
 
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row["expectedDeliveryDate"] = _strip_timezone_offset(row.get("expectedDeliveryDate"))
+            row["statusChangeDate"] = _strip_timezone_offset(row.get("statusChangeDate"))
+
         return {
             "purchaseNumber": header.get("purchaseNumber") or summary.get("purchaseNumber"),
             "status": header.get("status") or summary.get("status"),
-            "createDate": header.get("createDate") or summary.get("createDate"),
+            "createDate": _strip_timezone_offset(header.get("createDate") or summary.get("createDate")),
             "warehouse": header.get("warehouse") or summary.get("warehouse"),
             "isOpen": summary.get("isOpen", True),
             "isReceived": summary.get("isReceived", False),
             "externalOrderNumber": header.get("externalOrderNumber") or summary.get("externalOrderNumber", ""),
             "supplierOrderNumber": header.get("supplierOrderNumber") or summary.get("supplierOrderNumber", ""),
             "shippedDate": header.get("shippedDate") or summary.get("shippedDate"),
-            "changeDate": header.get("changeDate") or summary.get("changeDate"),
+            "changeDate": _strip_timezone_offset(header.get("changeDate") or summary.get("changeDate")),
             # PurchaseOrderSupplier
             "supplierNumber": supplier.get("supplierNumber") or summary.get("supplierNumber"),
             "supplierName": supplier.get("supplierName") or summary.get("supplierName"),
@@ -1689,14 +1715,14 @@ class PurchaseOrdersStream(ExtendStream):
         return {
             "purchaseNumber": summary.get("purchaseNumber"),
             "status": summary.get("status"),
-            "createDate": summary.get("createDate"),
+            "createDate": _strip_timezone_offset(summary.get("createDate")),
             "warehouse": summary.get("warehouse"),
             "isOpen": summary.get("isOpen", True),
             "isReceived": summary.get("isReceived", False),
             "externalOrderNumber": summary.get("externalOrderNumber", ""),
             "supplierOrderNumber": summary.get("supplierOrderNumber", ""),
             "shippedDate": summary.get("shippedDate"),
-            "changeDate": summary.get("changeDate"),
+            "changeDate": _strip_timezone_offset(summary.get("changeDate")),
             "supplierNumber": summary.get("supplierNumber"),
             "supplierName": summary.get("supplierName"),
             "supplierAgreementNumber": None,
