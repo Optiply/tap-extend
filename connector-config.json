@@ -16,11 +16,11 @@
     },
     "client": {
       "label": "Client Shortname",
-      "description": "Your client identifier in Extend Commerce. Example: MAXGAMING"
+      "description": "Your client identifier in Extend Commerce. Example: YOURCLIENT"
     },
     "warehouse_codes": {
       "label": "Warehouse Codes",
-      "description": "Comma-separated list of warehouse codes to sync. Leave empty to sync all. Exclude RMA/returns warehouses (e.g. MAXRMA).",
+      "description": "Comma-separated list of warehouse codes to sync. Leave empty to sync all. Exclude RMA/returns warehouses (e.g. RETURN_WH).",
       "type": "text",
       "required": false
     },
