@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, List
 
 from hotglue_singer_sdk import Tap
@@ -20,19 +21,38 @@ from tap_extend.streams import (
 )
 
 
+class _SuppressEmptyUnmappedPropertiesFilter(logging.Filter):
+    """Suppress SDK noise when it logs an empty tuple of unmapped properties."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Properties () were present" not in record.getMessage()
+
+
+def _install_logging_filters() -> None:
+    tap_logger = logging.getLogger("tap-extend")
+    if not any(
+        isinstance(existing_filter, _SuppressEmptyUnmappedPropertiesFilter)
+        for existing_filter in tap_logger.filters
+    ):
+        tap_logger.addFilter(_SuppressEmptyUnmappedPropertiesFilter())
+
+
+_install_logging_filters()
+
+
 class TapExtend(Tap):
     """Singer tap for Extend Commerce (Lxir) REST API.
 
     Streams:
       - suppliers                     FULL_TABLE  GET /Supplier
       - supplier_agreements           FULL_TABLE  GET /SupplierAgreement (active=true)
-      - product_supplier_agreements   FULL_TABLE  GET /ProductSupplierAgreements
-      - products                      INCREMENTAL GET /Products (modifiedDateFrom)
+      - product_supplier_agreements   INCREMENTAL GET /ProductSupplierAgreements (child of supplier_agreements)
+      - products                      INCREMENTAL GET /Products (first run unfiltered, then modifiedDateFrom/modifiedDateTo)
       - product_availability          INCREMENTAL GET /ProductAvailability (modifiedDateFrom)
-      - customer_orders               INCREMENTAL GET /CustomerOrders (modifiedDateFrom)
+      - customer_orders               INCREMENTAL after bookmark exists via GET /CustomerOrders + detail (modifiedDateFrom/modifiedDateTo)
       - purchase_orders               INCREMENTAL GET /PurchaseOrders (createDateFrom)
-      - reports_order_headers         INCREMENTAL GET /reports/{client}/OrderHeaders (changeDate day-by-day)
-      - reports_order_rows            INCREMENTAL GET /reports/{client}/OrderRows    (changeDate day-by-day)
+      - reports_order_headers         INCREMENTAL historical-only GET /reports/{client}/OrderHeaders (changeDate day-by-day)
+      - reports_order_rows            INCREMENTAL historical-only GET /reports/{client}/OrderRows    (changeDate day-by-day)
     """
 
     name = "tap-extend"
@@ -70,28 +90,12 @@ class TapExtend(Tap):
             description="Earliest record date to sync (ISO 8601)",
         ),
         th.Property(
-            "end_date",
-            th.DateTimeType,
-            required=False,
-            description="Latest record date to sync (ISO 8601). Used as upper bound on incremental streams.",
-        ),
-        th.Property(
             "warehouse_codes",
             th.StringType,
             required=False,
             description=(
                 "Comma-separated warehouse codes to include. "
                 "If omitted, all warehouses are synced."
-            ),
-        ),
-        th.Property(
-            "requests_per_second",
-            th.NumberType,
-            required=False,
-            default=4,
-            description=(
-                "Client-side request throttle for Extend API calls. "
-                "Default 4 req/s to stay below Extend's standard 5 req/s limit."
             ),
         ),
     ).to_dict()
@@ -105,8 +109,19 @@ class TapExtend(Tap):
         return wc or None
 
     def load_state(self, state: dict[str, Any]) -> None:
-        """Normalize legacy scalar bookmarks before delegating to the SDK."""
-        super().load_state(self._normalize_legacy_bookmarks(state))
+        """Normalize bookmarks and preserve report-only top-level overrides."""
+        normalized_state = self._normalize_legacy_bookmarks(state)
+        self._loaded_state = normalized_state
+        super().load_state(normalized_state)
+
+        # hotglue_singer_sdk.Tap.load_state only copies values under
+        # "bookmarks". Keep these report-only controls at the root of the
+        # in-memory tap state so report streams can use one-off backfill bounds
+        # without exposing them as config.
+        for key in ("reports_start_date", "reports_end_date"):
+            value = normalized_state.get(key)
+            if value not in (None, ""):
+                self.state[key] = value
 
     def _normalize_legacy_bookmarks(self, state: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(state, dict):
@@ -121,6 +136,10 @@ class TapExtend(Tap):
 
         for stream_name, stream_state in bookmarks.items():
             if isinstance(stream_state, dict):
+                if stream_name == "product_supplier_agreements":
+                    stream_state = self._normalize_product_supplier_agreements_bookmark(
+                        stream_state
+                    )
                 normalized_bookmarks[stream_name] = stream_state
                 continue
 
@@ -147,6 +166,40 @@ class TapExtend(Tap):
 
         normalized_state["bookmarks"] = normalized_bookmarks
         return normalized_state
+
+    def _normalize_product_supplier_agreements_bookmark(
+        self,
+        stream_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Promote legacy PSA progress-marker state to a normal Singer bookmark."""
+        if stream_state.get("replication_key") == "changeDate" and stream_state.get(
+            "replication_key_value"
+        ) not in (None, ""):
+            return stream_state
+
+        bookmark_value = stream_state.get("replication_key_signpost")
+        source = "replication_key_signpost"
+        progress_markers = stream_state.get("progress_markers")
+        if bookmark_value in (None, "") and isinstance(progress_markers, dict):
+            if progress_markers.get("replication_key") == "changeDate":
+                bookmark_value = progress_markers.get("replication_key_value")
+                source = "progress_markers.replication_key_value"
+
+        if bookmark_value in (None, ""):
+            return stream_state
+
+        self.logger.warning(
+            "Normalizing product_supplier_agreements bookmark from %s=%s.",
+            source,
+            bookmark_value,
+        )
+        normalized = dict(stream_state)
+        normalized["replication_key"] = "changeDate"
+        normalized["replication_key_value"] = bookmark_value
+        normalized.pop("replication_key_signpost", None)
+        normalized.pop("starting_replication_value", None)
+        normalized.pop("progress_markers", None)
+        return normalized
 
     def discover_streams(self) -> List:
         """Return stream instances."""

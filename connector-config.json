@@ -16,18 +16,12 @@
     },
     "client": {
       "label": "Client Shortname",
-      "description": "Your client identifier in Extend Commerce. Example: MAXGAMING"
+      "description": "Your client identifier in Extend Commerce. Example: YOURCLIENT"
     },
     "warehouse_codes": {
       "label": "Warehouse Codes",
-      "description": "Comma-separated list of warehouse codes to sync. Leave empty to sync all. Exclude RMA/returns warehouses (e.g. MAXRMA).",
+      "description": "Comma-separated list of warehouse codes to sync. Leave empty to sync all. Exclude RMA/returns warehouses (e.g. RETURN_WH).",
       "type": "text",
-      "required": false
-    },
-    "requests_per_second": {
-      "label": "Requests Per Second",
-      "description": "Client-side throttle for Extend API calls. Default 4 req/s to stay below Extend's standard 5 req/s limit. Lower this if Extend marks a tenant or endpoint as low-performance.",
-      "type": "number",
       "required": false
     },
     "sync_leadTime_supProducts": {
@@ -40,7 +34,6 @@
   "config": {
     "start_date": "2010-01-01T00:00:00Z",
     "api_url": "https://s05.extend.se/RESTAPI",
-    "requests_per_second": 4,
     "warehouse_codes": null
   },
   "label": "Extend Commerce",
